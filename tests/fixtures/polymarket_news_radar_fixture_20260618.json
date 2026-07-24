@@ -1,0 +1,267 @@
+{
+  "generated_at": "2026-06-18T15:05:00+08:00",
+  "now_utc": "2026-06-18T07:05:00+00:00",
+  "samples": [
+    {
+      "name": "iran_meeting_june21",
+      "event": {
+        "id": "iran-meeting",
+        "title": "US x Iran diplomatic meeting by...?",
+        "slug": "us-x-iran-diplomatic-meeting-by",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-22T00:00:00Z",
+        "markets": [
+          {
+            "id": "iran-meeting-june21",
+            "question": "US x Iran diplomatic meeting by June 21, 2026?",
+            "groupItemTitle": "June 21",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-22T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.903\", \"0.097\"]",
+            "oneDayPriceChange": -0.038,
+            "volume24hr": 1000000,
+            "liquidity": 450000
+          }
+        ]
+      }
+    },
+    {
+      "name": "iran_meeting_june19",
+      "event": {
+        "id": "iran-meeting",
+        "title": "US x Iran diplomatic meeting by...?",
+        "slug": "us-x-iran-diplomatic-meeting-by",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-20T00:00:00Z",
+        "markets": [
+          {
+            "id": "iran-meeting-june19",
+            "question": "US x Iran diplomatic meeting by June 19, 2026?",
+            "groupItemTitle": "June 19",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.724\", \"0.276\"]",
+            "oneDayPriceChange": -0.198,
+            "volume24hr": 900000,
+            "liquidity": 400000
+          }
+        ]
+      }
+    },
+    {
+      "name": "iran_meeting_switzerland",
+      "event": {
+        "id": "iran-meeting-place",
+        "title": "Next diplomatic US-Iran meeting location",
+        "slug": "next-diplomatic-us-iran-meeting-location",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-30T00:00:00Z",
+        "markets": [
+          {
+            "id": "iran-meeting-switzerland",
+            "question": "Will the next diplomatic US-Iran meeting be in Switzerland?",
+            "groupItemTitle": "Switzerland",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-30T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.795\", \"0.204\"]",
+            "oneDayPriceChange": -0.021,
+            "volume24hr": 1490000,
+            "liquidity": 520000
+          }
+        ]
+      }
+    },
+    {
+      "name": "iran_text_release",
+      "event": {
+        "id": "iran-text",
+        "title": "US-Iran agreement text",
+        "slug": "us-iran-agreement-text",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-21T00:00:00Z",
+        "markets": [
+          {
+            "id": "iran-text-june20",
+            "question": "Will the text of the US-Iran agreement be released by June 20?",
+            "groupItemTitle": "June 20",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-21T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.505\", \"0.495\"]",
+            "oneDayPriceChange": 0.15,
+            "volume24hr": 120000,
+            "liquidity": 100000
+          }
+        ]
+      }
+    },
+    {
+      "name": "musk_tweets_160_179",
+      "event": {
+        "id": "musk-tweets",
+        "title": "Elon Musk # tweets June 12 - June 19, 2026?",
+        "slug": "elon-musk-tweets-june-12-june-19-2026",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-20T00:00:00Z",
+        "markets": [
+          {
+            "id": "musk-160-179",
+            "question": "Will Elon Musk post 160-179 tweets from June 12 to June 19, 2026?",
+            "groupItemTitle": "160-179",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.028\", \"0.972\"]",
+            "oneDayPriceChange": -0.117,
+            "volume24hr": 210000,
+            "liquidity": 180000
+          }
+        ]
+      }
+    },
+    {
+      "name": "musk_tweets_180_199",
+      "event": {
+        "id": "musk-tweets",
+        "title": "Elon Musk # tweets June 12 - June 19, 2026?",
+        "slug": "elon-musk-tweets-june-12-june-19-2026",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-20T00:00:00Z",
+        "markets": [
+          {
+            "id": "musk-180-199",
+            "question": "Will Elon Musk post 180-199 tweets from June 12 to June 19, 2026?",
+            "groupItemTitle": "180-199",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.395\", \"0.605\"]",
+            "oneDayPriceChange": -0.03,
+            "volume24hr": 150000,
+            "liquidity": 160000
+          }
+        ]
+      }
+    },
+    {
+      "name": "musk_tweets_200_219",
+      "event": {
+        "id": "musk-tweets",
+        "title": "Elon Musk # tweets June 12 - June 19, 2026?",
+        "slug": "elon-musk-tweets-june-12-june-19-2026",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-20T00:00:00Z",
+        "markets": [
+          {
+            "id": "musk-200-219",
+            "question": "Will Elon Musk post 200-219 tweets from June 12 to June 19, 2026?",
+            "groupItemTitle": "200-219",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.475\", \"0.525\"]",
+            "oneDayPriceChange": 0.15,
+            "volume24hr": 160000,
+            "liquidity": 170000
+          }
+        ]
+      }
+    },
+    {
+      "name": "claude_fable_restore",
+      "event": {
+        "id": "claude-fable",
+        "title": "Claude Fable 5 restored for US customers",
+        "slug": "claude-fable-5-restored-for-us-customers",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-07-02T00:00:00Z",
+        "markets": [
+          {
+            "id": "claude-fable-july1",
+            "question": "Will Claude Fable 5 be restored for US customers by July 1?",
+            "groupItemTitle": "July 1",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-07-02T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.395\", \"0.605\"]",
+            "oneDayPriceChange": -0.25,
+            "volume24hr": 230000,
+            "liquidity": 140000
+          }
+        ]
+      }
+    },
+    {
+      "name": "usa_match_win",
+      "event": {
+        "id": "usa-match",
+        "title": "United States vs. Canada",
+        "slug": "united-states-vs-canada",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-20T00:00:00Z",
+        "markets": [
+          {
+            "id": "usa-win-june19",
+            "question": "Will USA win on 2026-06-19?",
+            "groupItemTitle": "USA",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.615\", \"0.385\"]",
+            "oneDayPriceChange": 0.08,
+            "volume24hr": 400000,
+            "liquidity": 200000
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+outbox/
+state/*.json
+state/*.jsonl

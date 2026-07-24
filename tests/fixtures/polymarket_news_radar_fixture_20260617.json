@@ -1,0 +1,212 @@
+{
+  "generated_at": "2026-06-17T15:05:00+08:00",
+  "now_utc": "2026-06-17T07:05:00+00:00",
+  "samples": [
+    {
+      "name": "expired_iran_peace_deal",
+      "expected": {
+        "eligible": false,
+        "reject_reason": "deadline_passed",
+        "effective_deadline_sgt": "2026-06-15 08:00 SGT"
+      },
+      "event": {
+        "id": "357807",
+        "title": "US x Iran permanent peace deal by...?",
+        "slug": "us-x-iran-permanent-peace-deal-by",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-12-31T00:00:00Z",
+        "markets": [
+          {
+            "id": "2270330",
+            "question": "US x Iran permanent peace deal by June 15, 2026?",
+            "groupItemTitle": "June 15",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-15T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.9985\", \"0.0015\"]",
+            "oneDayPriceChange": 0.0335,
+            "volume24hr": 18880080.419529013,
+            "liquidity": 3097121.65315
+          }
+        ]
+      }
+    },
+    {
+      "name": "future_iran_text_release",
+      "expected": {
+        "eligible": true,
+        "category": "geopolitics",
+        "title_contains": "美国-伊朗协议文本是否在6月19日前发布"
+      },
+      "event": {
+        "id": "iran-text-release",
+        "title": "US-Iran deal text released by...?",
+        "slug": "us-iran-deal-text-released-by",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-07-01T03:59:00Z",
+        "markets": [
+          {
+            "id": "iran-text-release-june19",
+            "question": "Will the text of the US-Iran agreement be released by June 19?",
+            "groupItemTitle": "June 19",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-20T03:59:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.8755\", \"0.1245\"]",
+            "oneDayPriceChange": 0.1505,
+            "volume24hr": 54429.708332000024,
+            "liquidity": 120000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fed_no_cuts_2026",
+      "expected": {
+        "eligible": true,
+        "category": "macro_finance",
+        "title_contains": "2026年是否没有美联储降息"
+      },
+      "event": {
+        "id": "fed-cuts-2026",
+        "title": "How many Fed rate cuts in 2026?",
+        "slug": "how-many-fed-rate-cuts-in-2026",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-12-31T00:00:00Z",
+        "markets": [
+          {
+            "id": "fed-no-cuts-2026",
+            "question": "Will no Fed rate cuts happen in 2026?",
+            "groupItemTitle": "0 (0 bps)",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-12-31T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.6875\", \"0.3125\"]",
+            "oneDayPriceChange": -0.0005,
+            "volume24hr": 22171.142725,
+            "liquidity": 80000
+          }
+        ]
+      }
+    },
+    {
+      "name": "fed_july_no_change",
+      "expected": {
+        "eligible": true,
+        "category": "macro_finance",
+        "title_contains": "7月2026年会议后美联储利率是否不变"
+      },
+      "event": {
+        "id": "fed-july-decision",
+        "title": "Fed Decision in July?",
+        "slug": "fed-decision-in-july-2026",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-07-29T00:00:00Z",
+        "markets": [
+          {
+            "id": "fed-july-no-change",
+            "question": "Will there be no change in Fed interest rates after the July 2026 meeting?",
+            "groupItemTitle": "No change",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-07-29T00:00:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.925\", \"0.075\"]",
+            "oneDayPriceChange": -0.02,
+            "volume24hr": 52777.781375,
+            "liquidity": 150000
+          }
+        ]
+      }
+    },
+    {
+      "name": "dota_dragon_market",
+      "expected": {
+        "eligible": true,
+        "category": "sports",
+        "title_contains": "第1局双方是否都击杀小龙"
+      },
+      "event": {
+        "id": "dota-dragon",
+        "title": "Dota 2: Team Refuser vs Game Master (BO3) - The International China Closed Qualifier Playoffs",
+        "slug": "dota-team-refuser-game-master",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-17T10:00:00Z",
+        "markets": [
+          {
+            "id": "game-1-both-teams-slay-dragon",
+            "question": "Game 1: Both Teams Slay a Dragon",
+            "groupItemTitle": "Both Teams Slay a Dragon",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-17T10:00:00Z",
+            "gameStartTime": "2026-06-17 04:00:00+00",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.005\", \"0.995\"]",
+            "oneDayPriceChange": null,
+            "volume24hr": 440000,
+            "liquidity": 50000
+          }
+        ]
+      }
+    },
+    {
+      "name": "crude_low_75",
+      "expected": {
+        "eligible": true,
+        "category": "macro_finance",
+        "title_contains": "原油在6月底是否触及75美元（低点）"
+      },
+      "event": {
+        "id": "crude-low-75",
+        "title": "Will Crude Oil (CL) hit__ by end of June?",
+        "slug": "will-crude-oil-hit-by-end-of-june",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "endDate": "2026-06-30T18:30:00Z",
+        "description": "Market may react to Iran and Strait of Hormuz headlines.",
+        "markets": [
+          {
+            "id": "crude-low-75-market",
+            "question": "Will Crude Oil (CL) hit (LOW) $75 by end of June?",
+            "groupItemTitle": "↓ $75",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "acceptingOrders": true,
+            "endDate": "2026-06-30T18:30:00Z",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0.875\", \"0.125\"]",
+            "oneDayPriceChange": 0.45,
+            "volume24hr": 30825.058143000013,
+            "liquidity": 80000
+          }
+        ]
+      }
+    }
+  ]
+}
