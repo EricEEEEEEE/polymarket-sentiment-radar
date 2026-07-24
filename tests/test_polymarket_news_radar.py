@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 
@@ -766,3 +767,200 @@ def test_new_scope_templates_keep_titles_chinese_and_categories_clean():
         assert signal is not None
         assert signal.category.key == category_key
         assert radar.market_title_cn(signal) == expected_title
+
+
+def test_market_volume_24h_does_not_substitute_lifetime_volume():
+    radar = load_module()
+
+    market = {
+        "volume24hr": 239.44,
+        "volume24hrClob": 239.44,
+        "volume": 549_121.43,
+    }
+    zero_activity_market = {
+        "volume24hr": 0,
+        "volume": 900_000,
+    }
+    legacy_market = {"volume": 12_345}
+
+    assert radar.market_volume_24h(market) == 239.44
+    assert radar.market_volume_24h(zero_activity_market) == 0
+    assert radar.market_volume_24h(legacy_market) == 12_345
+
+
+def test_run_returns_nonzero_when_all_core_sources_fail(monkeypatch, tmp_path):
+    radar = load_module()
+    collection = radar.CollectionResult(
+        signals=[],
+        rejected=[],
+        raw_candidate_count=0,
+        source_counts={
+            "events_legacy": 0,
+            "events_keyset": 0,
+            "events_search": 0,
+            "markets_legacy": 0,
+            "markets_keyset": 0,
+            "events": 0,
+            "markets": 0,
+            "eligible": 0,
+            "rejected": 0,
+        },
+        source_health={
+            "core_healthy": False,
+            "attempt_count": 5,
+            "success_count": 0,
+            "failure_count": 5,
+            "failures": [{"source": "events_legacy", "error_type": "TimeoutError"}],
+        },
+    )
+    monkeypatch.setattr(radar, "LATEST_PATH", tmp_path / "latest.json")
+    monkeypatch.setattr(radar, "HISTORY_PATH", tmp_path / "history.jsonl")
+    monkeypatch.setattr(radar, "RUN_LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(radar, "collect_signal_result", lambda _limit: collection)
+    args = argparse.Namespace(
+        limit=120,
+        force=False,
+        dry_run=True,
+        no_image=False,
+        explain=False,
+    )
+
+    assert radar.run(args) == 2
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    history = json.loads((tmp_path / "history.jsonl").read_text().strip())
+    assert latest["status"] == "source_unavailable"
+    assert history["status"] == "source_unavailable"
+
+
+def test_send_photo_does_not_retry_ambiguous_requests_failure(monkeypatch, tmp_path):
+    radar = load_module()
+    image_path = tmp_path / "radar.png"
+    image_path.write_bytes(b"png")
+
+    class FailingRequests:
+        @staticmethod
+        def post(*_args, **_kwargs):
+            raise TimeoutError("response timeout")
+
+    monkeypatch.setattr(radar, "requests", FailingRequests)
+    monkeypatch.setattr(
+        radar,
+        "send_photo_via_curl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an ambiguous request failure must not be retried")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        radar.send_photo("token", "-100", 412, image_path, "摘要")
+
+
+def test_invalid_json_state_fails_closed(tmp_path):
+    radar = load_module()
+    state_path = tmp_path / "seen.json"
+    state_path.write_text("{")
+
+    with pytest.raises(RuntimeError, match="Invalid JSON state"):
+        radar.read_json(state_path, {})
+
+
+def test_single_instance_lock_rejects_second_holder(tmp_path):
+    radar = load_module()
+    lock_path = tmp_path / "run.lock"
+
+    with radar.single_instance_lock(lock_path):
+        with pytest.raises(RuntimeError, match="already running"):
+            with radar.single_instance_lock(lock_path):
+                pass
+
+
+def test_text_fallback_writes_html_and_json_outbox(monkeypatch, tmp_path):
+    radar = load_module()
+    signals = build_fixture_signals(radar, load_fixture_20260618())
+    sections = radar.report_items_by_section(signals)
+    digest_items = radar.digest_items_by_interest(sections)
+    source_payload = radar.build_visual_source_payload(
+        digest_items,
+        total_count=999,
+        eligible_count=len(signals),
+        timestamp="2026-07-24 15:00 SGT",
+    )
+    assert source_payload is not None
+    monkeypatch.setattr(radar, "OUTBOX_DIR", tmp_path)
+
+    evidence = radar.write_visual_outbox(
+        None,
+        "文字摘要",
+        "完整报告",
+        dry_run=True,
+        source_payload=source_payload,
+    )
+
+    payload = json.loads(Path(evidence["json"]).read_text())
+    assert Path(evidence["html"]).read_text() == "文字摘要"
+    assert Path(evidence["detail_html"]).read_text() == "完整报告"
+    assert payload["selected_modality"] == "text"
+    assert payload["image_path"] is None
+    assert payload["delivery"] == "dry_run"
+
+
+def test_fetch_diagnostics_reports_all_core_sources_failed(monkeypatch):
+    radar = load_module()
+    diagnostics = radar.FetchDiagnostics()
+
+    monkeypatch.setattr(
+        radar,
+        "fetch_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("upstream timeout")),
+    )
+    for source in radar.CORE_FETCH_SOURCES:
+        assert radar.safe_fetch_json(
+            "https://example.invalid",
+            diagnostics=diagnostics,
+            source=source,
+        ) is None
+
+    health = diagnostics.snapshot()
+    assert health["core_healthy"] is False
+    assert health["attempt_count"] == len(radar.CORE_FETCH_SOURCES)
+    assert health["failure_count"] == len(radar.CORE_FETCH_SOURCES)
+
+
+def test_pending_delivery_reservation_blocks_duplicate_story(monkeypatch, tmp_path):
+    radar = load_module()
+    signals = build_fixture_signals(radar, load_fixture_20260618())
+    sections = radar.report_items_by_section(signals)
+    digest_items = radar.digest_items_by_interest(sections)
+    monkeypatch.setattr(radar, "DISPLAY_SEEN_PATH", tmp_path / "display_seen.json")
+    monkeypatch.setattr(radar, "LATEST_PATH", tmp_path / "latest.json")
+
+    reserved_at = radar.mark_digest_pending(digest_items)
+    display_seen = radar.load_display_seen()
+
+    assert display_seen
+    assert all(record["delivery_status"] == "pending" for record in display_seen.values())
+    assert all(record["sent_at"] == reserved_at for record in display_seen.values())
+    assert all(
+        radar.display_story_recently_seen(item.story_key, display_seen)
+        for _section_key, item in digest_items
+    )
+
+
+def test_telegram_request_errors_redact_bot_token(monkeypatch, tmp_path):
+    radar = load_module()
+    image_path = tmp_path / "radar.png"
+    image_path.write_bytes(b"png")
+    token = "123456789:super-secret-token-value"
+
+    class FailingRequests:
+        @staticmethod
+        def post(url, **_kwargs):
+            raise TimeoutError(url)
+
+    monkeypatch.setattr(radar, "requests", FailingRequests)
+
+    with pytest.raises(RuntimeError) as error:
+        radar.send_photo(token, "-100", 412, image_path, "摘要")
+
+    assert token not in str(error.value)
+    assert "<redacted>" in str(error.value)

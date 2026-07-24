@@ -7,16 +7,20 @@ Read-only public market scan. No wallet, no private key, no trading.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 import warnings
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape, unescape
@@ -39,10 +43,11 @@ HISTORY_PATH = STATE_DIR / "polymarket_news_radar_history.jsonl"
 SEEN_PATH = STATE_DIR / "polymarket_news_radar_seen.json"
 DISPLAY_SEEN_PATH = STATE_DIR / "polymarket_news_radar_display_seen.json"
 LATEST_PATH = STATE_DIR / "polymarket_news_radar_latest.json"
+RUN_LOCK_PATH = STATE_DIR / "polymarket_news_radar.lock"
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-USER_AGENT = "fab-polymarket-news-radar/3.0"
-RADAR_VERSION = "V3.0"
+USER_AGENT = "fab-polymarket-news-radar/3.1"
+RADAR_VERSION = "V3.1"
 
 MIN_VOLUME_24H = 25_000.0
 SEND_SCORE = 68.0
@@ -478,6 +483,15 @@ DISCOVERY_QUERIES_BY_SECTION: dict[str, tuple[str, ...]] = {
 }
 
 DISPLAY_TRANSLATION_STATUSES = {"ok", "needs_review"}
+CORE_FETCH_SOURCES = frozenset(
+    {
+        "events_legacy",
+        "events_keyset",
+        "markets_legacy",
+        "markets_keyset",
+    }
+)
+_ACTIVE_LOCK_PATHS: set[Path] = set()
 
 
 @dataclass
@@ -526,6 +540,43 @@ class CollectionResult:
     rejected: list[dict[str, Any]]
     raw_candidate_count: int
     source_counts: dict[str, int]
+    source_health: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FetchDiagnostics:
+    attempts: Counter[str] = field(default_factory=Counter)
+    successes: Counter[str] = field(default_factory=Counter)
+    failures: list[dict[str, str]] = field(default_factory=list)
+
+    def record_attempt(self, source: str) -> None:
+        self.attempts[source] += 1
+
+    def record_success(self, source: str) -> None:
+        self.successes[source] += 1
+
+    def record_failure(self, source: str, exc: Exception) -> None:
+        self.failures.append(
+            {
+                "source": source,
+                "error_type": type(exc).__name__,
+                "error": clean_text(str(exc), 240),
+            }
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        core_success_count = sum(self.successes[source] for source in CORE_FETCH_SOURCES)
+        return {
+            "core_healthy": core_success_count > 0,
+            "partial_failure": bool(self.failures),
+            "attempt_count": sum(self.attempts.values()),
+            "success_count": sum(self.successes.values()),
+            "failure_count": len(self.failures),
+            "core_success_count": core_success_count,
+            "source_attempts": dict(self.attempts),
+            "source_successes": dict(self.successes),
+            "failures": self.failures[:20],
+        }
 
 
 @dataclass(frozen=True)
@@ -585,7 +636,7 @@ def load_env(path: Path = ENV_PATH) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
         return env
-    for raw_line in path.read_text().splitlines():
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -598,19 +649,37 @@ def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Invalid JSON state: {path}") from exc
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    atomic_write_text(path, text)
 
 
 def visible_html_len(value: str) -> int:
@@ -631,8 +700,35 @@ def canonical_json(value: Any) -> str:
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
+    with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+@contextmanager
+def single_instance_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path = path.resolve()
+    if resolved_path in _ACTIVE_LOCK_PATHS:
+        raise RuntimeError(f"Polymarket radar is already running: {path}")
+
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Polymarket radar is already running: {path}") from exc
+        _ACTIVE_LOCK_PATHS.add(resolved_path)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started_at={iso_now()}\n")
+        handle.flush()
+        yield
+    finally:
+        _ACTIVE_LOCK_PATHS.discard(resolved_path)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> Any:
@@ -643,11 +739,25 @@ def fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 30
         return json.loads(response.read().decode("utf-8"))
 
 
-def safe_fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> Any | None:
+def safe_fetch_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    timeout: int = 30,
+    *,
+    diagnostics: FetchDiagnostics | None = None,
+    source: str = "unknown",
+) -> Any | None:
+    if diagnostics is not None:
+        diagnostics.record_attempt(source)
     try:
-        return fetch_json(url, params=params, timeout=timeout)
-    except Exception:  # noqa: BLE001
+        payload = fetch_json(url, params=params, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics.record_failure(source, exc)
         return None
+    if diagnostics is not None:
+        diagnostics.record_success(source)
+    return payload
 
 
 def unique_records(records: list[dict[str, Any]], identity_fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -669,6 +779,9 @@ def fetch_keyset_pages(
     params: dict[str, Any],
     item_key: str,
     pages: int,
+    *,
+    diagnostics: FetchDiagnostics | None = None,
+    source: str,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -676,7 +789,12 @@ def fetch_keyset_pages(
         page_params = {key: value for key, value in params.items() if value not in (None, "")}
         if cursor:
             page_params["after_cursor"] = cursor
-        payload = safe_fetch_json(f"{GAMMA_BASE}{endpoint}", params=page_params)
+        payload = safe_fetch_json(
+            f"{GAMMA_BASE}{endpoint}",
+            params=page_params,
+            diagnostics=diagnostics,
+            source=source,
+        )
         if not isinstance(payload, dict):
             break
         items = payload.get(item_key)
@@ -2253,11 +2371,14 @@ def days_until(value: str | None) -> float | None:
 
 
 def market_volume_24h(market: dict[str, Any]) -> float:
-    return max(
-        fnum(market.get("volume24hr")),
-        fnum(market.get("volume24hrClob")),
-        fnum(market.get("volume")),
-    )
+    explicit_24h = [
+        fnum(market[key])
+        for key in ("volume24hr", "volume24hrClob", "volume24hrAmm")
+        if market.get(key) not in (None, "")
+    ]
+    if explicit_24h:
+        return max(explicit_24h)
+    return fnum(market.get("volume"))
 
 
 def market_liquidity(market: dict[str, Any]) -> float:
@@ -2511,14 +2632,22 @@ def event_to_signal(event: dict[str, Any], now: datetime | None = None, source_s
     return signal
 
 
-def fetch_events_legacy(limit: int) -> list[dict[str, Any]]:
+def fetch_events_legacy(
+    limit: int,
+    diagnostics: FetchDiagnostics | None = None,
+) -> list[dict[str, Any]]:
     pages: list[list[dict[str, Any]]] = []
     for params in (
         {"active": "true", "closed": "false", "order": "volume24hr", "ascending": "false", "limit": limit},
         {"active": "true", "closed": "false", "order": "updatedAt", "ascending": "false", "limit": min(limit, 60)},
         {"active": "true", "closed": "false", "order": "createdAt", "ascending": "false", "limit": min(limit, 60)},
     ):
-        payload = safe_fetch_json(f"{GAMMA_BASE}/events", params=params)
+        payload = safe_fetch_json(
+            f"{GAMMA_BASE}/events",
+            params=params,
+            diagnostics=diagnostics,
+            source="events_legacy",
+        )
         if isinstance(payload, list):
             pages.append(payload)
     return unique_records(
@@ -2527,7 +2656,10 @@ def fetch_events_legacy(limit: int) -> list[dict[str, Any]]:
     )
 
 
-def fetch_events_keyset(limit: int) -> list[dict[str, Any]]:
+def fetch_events_keyset(
+    limit: int,
+    diagnostics: FetchDiagnostics | None = None,
+) -> list[dict[str, Any]]:
     page_limit = min(500, max(limit, 100))
     records: list[dict[str, Any]] = []
     for params in (
@@ -2535,11 +2667,22 @@ def fetch_events_keyset(limit: int) -> list[dict[str, Any]]:
         {"closed": "false", "order": "updatedAt", "ascending": "false", "limit": page_limit},
         {"closed": "false", "order": "createdAt", "ascending": "false", "limit": page_limit},
     ):
-        records.extend(fetch_keyset_pages("/events/keyset", params, "events", KEYSET_EVENT_PAGES))
+        records.extend(
+            fetch_keyset_pages(
+                "/events/keyset",
+                params,
+                "events",
+                KEYSET_EVENT_PAGES,
+                diagnostics=diagnostics,
+                source="events_keyset",
+            )
+        )
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_public_search_events() -> list[dict[str, Any]]:
+def fetch_public_search_events(
+    diagnostics: FetchDiagnostics | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen_queries: set[str] = set()
     for queries in DISCOVERY_QUERIES_BY_SECTION.values():
@@ -2558,6 +2701,8 @@ def fetch_public_search_events() -> list[dict[str, Any]]:
                     "search_profiles": "false",
                 },
                 timeout=20,
+                diagnostics=diagnostics,
+                source="events_search",
             )
             if not isinstance(payload, dict):
                 continue
@@ -2567,11 +2712,14 @@ def fetch_public_search_events() -> list[dict[str, Any]]:
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_event_sources(limit: int) -> dict[str, list[dict[str, Any]]]:
+def fetch_event_sources(
+    limit: int,
+    diagnostics: FetchDiagnostics | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     return {
-        "events_legacy": fetch_events_legacy(limit),
-        "events_keyset": fetch_events_keyset(limit),
-        "events_search": fetch_public_search_events(),
+        "events_legacy": fetch_events_legacy(limit, diagnostics=diagnostics),
+        "events_keyset": fetch_events_keyset(limit, diagnostics=diagnostics),
+        "events_search": fetch_public_search_events(diagnostics=diagnostics),
     }
 
 
@@ -2580,7 +2728,11 @@ def fetch_events(limit: int) -> list[dict[str, Any]]:
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_markets_legacy(limit: int, now: datetime | None = None) -> list[dict[str, Any]]:
+def fetch_markets_legacy(
+    limit: int,
+    now: datetime | None = None,
+    diagnostics: FetchDiagnostics | None = None,
+) -> list[dict[str, Any]]:
     now = now or now_utc()
     end_min = now.isoformat(timespec="seconds").replace("+00:00", "Z")
     end_max = (now + timedelta(days=MARKET_LOOKAHEAD_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -2605,7 +2757,12 @@ def fetch_markets_legacy(limit: int, now: datetime | None = None) -> list[dict[s
             "end_date_max": end_max,
         },
     ):
-        payload = safe_fetch_json(f"{GAMMA_BASE}/markets", params=params)
+        payload = safe_fetch_json(
+            f"{GAMMA_BASE}/markets",
+            params=params,
+            diagnostics=diagnostics,
+            source="markets_legacy",
+        )
         if isinstance(payload, list):
             pages.append(payload)
     return unique_records(
@@ -2614,7 +2771,11 @@ def fetch_markets_legacy(limit: int, now: datetime | None = None) -> list[dict[s
     )
 
 
-def fetch_markets_keyset(limit: int, now: datetime | None = None) -> list[dict[str, Any]]:
+def fetch_markets_keyset(
+    limit: int,
+    now: datetime | None = None,
+    diagnostics: FetchDiagnostics | None = None,
+) -> list[dict[str, Any]]:
     now = now or now_utc()
     end_min = now.isoformat(timespec="seconds").replace("+00:00", "Z")
     short_end_max = (now + timedelta(days=MARKET_LOOKAHEAD_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -2650,14 +2811,27 @@ def fetch_markets_keyset(limit: int, now: datetime | None = None) -> list[dict[s
             "include_tag": "true",
         },
     ):
-        records.extend(fetch_keyset_pages("/markets/keyset", params, "markets", KEYSET_MARKET_PAGES))
+        records.extend(
+            fetch_keyset_pages(
+                "/markets/keyset",
+                params,
+                "markets",
+                KEYSET_MARKET_PAGES,
+                diagnostics=diagnostics,
+                source="markets_keyset",
+            )
+        )
     return unique_records(records, ("id", "conditionId", "slug"))
 
 
-def fetch_market_sources(limit: int, now: datetime | None = None) -> dict[str, list[dict[str, Any]]]:
+def fetch_market_sources(
+    limit: int,
+    now: datetime | None = None,
+    diagnostics: FetchDiagnostics | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     return {
-        "markets_legacy": fetch_markets_legacy(limit, now=now),
-        "markets_keyset": fetch_markets_keyset(limit, now=now),
+        "markets_legacy": fetch_markets_legacy(limit, now=now, diagnostics=diagnostics),
+        "markets_keyset": fetch_markets_keyset(limit, now=now, diagnostics=diagnostics),
     }
 
 
@@ -2702,8 +2876,9 @@ def event_from_market(market: dict[str, Any]) -> dict[str, Any]:
 
 def collect_signal_result(limit: int, now: datetime | None = None) -> CollectionResult:
     now = now or now_utc()
-    event_sources = fetch_event_sources(limit)
-    market_sources = fetch_market_sources(limit, now=now)
+    diagnostics = FetchDiagnostics()
+    event_sources = fetch_event_sources(limit, diagnostics=diagnostics)
+    market_sources = fetch_market_sources(limit, now=now, diagnostics=diagnostics)
     future_markets = unique_records(
         [market for markets in market_sources.values() for market in markets],
         ("id", "conditionId", "slug"),
@@ -2762,6 +2937,7 @@ def collect_signal_result(limit: int, now: datetime | None = None) -> Collection
         rejected=rejected,
         raw_candidate_count=source_counts["events"] + source_counts["markets"],
         source_counts=source_counts,
+        source_health=diagnostics.snapshot(),
     )
 
 
@@ -2853,9 +3029,13 @@ def prune_display_seen(
     return pruned
 
 
-def mark_digest_sent(digest_items: list[tuple[str, ReportItem]]) -> None:
+def mark_digest_delivery_state(
+    digest_items: list[tuple[str, ReportItem]],
+    delivery_status: str,
+    sent_at: str | None = None,
+) -> str:
     display_seen = prune_display_seen(load_display_seen())
-    ts = iso_now()
+    ts = sent_at or iso_now()
     for section_key, item in digest_items:
         display_seen[item.story_key] = {
             "sent_at": ts,
@@ -2863,8 +3043,21 @@ def mark_digest_sent(digest_items: list[tuple[str, ReportItem]]) -> None:
             "section": section_key,
             "score": round(item.score, 2),
             "representative_market_id": item.representative.market_id,
+            "delivery_status": delivery_status,
         }
     write_json(DISPLAY_SEEN_PATH, display_seen)
+    return ts
+
+
+def mark_digest_pending(digest_items: list[tuple[str, ReportItem]]) -> str:
+    return mark_digest_delivery_state(digest_items, "pending")
+
+
+def mark_digest_sent(
+    digest_items: list[tuple[str, ReportItem]],
+    sent_at: str | None = None,
+) -> None:
+    mark_digest_delivery_state(digest_items, "sent", sent_at=sent_at)
 
 
 def should_send(signal: Signal, seen: dict[str, dict[str, Any]], force: bool = False) -> tuple[bool, str]:
@@ -3376,8 +3569,9 @@ def render_visual_card(
     digest_items: list[tuple[str, ReportItem]],
     total_count: int,
     eligible_count: int,
+    source_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    source_payload = build_visual_source_payload(digest_items, total_count, eligible_count)
+    source_payload = source_payload or build_visual_source_payload(digest_items, total_count, eligible_count)
     if source_payload is None:
         return None
     script_dir = str(Path(__file__).resolve().parent)
@@ -3397,15 +3591,19 @@ def render_visual_card(
 
 
 def write_visual_outbox(
-    visual_artifact: dict[str, Any],
+    visual_artifact: dict[str, Any] | None,
     caption: str,
     report_text: str,
     *,
     dry_run: bool,
     delivery: Any = None,
+    source_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    source = visual_artifact["source_payload"]
-    image_path = Path(visual_artifact["path"])
+    source = visual_artifact["source_payload"] if visual_artifact else source_payload
+    if source is None:
+        raise RuntimeError("Outbox source payload unavailable")
+    image_path = Path(visual_artifact["path"]) if visual_artifact else None
+    bundle = visual_artifact["bundle"] if visual_artifact else None
     html_path = OUTBOX_DIR / "latest-polymarket-daily.html"
     detail_html_path = OUTBOX_DIR / "latest-polymarket-daily-detail.html"
     json_path = OUTBOX_DIR / "latest-polymarket-daily.json"
@@ -3416,27 +3614,29 @@ def write_visual_outbox(
         "job": "polymarket-daily",
         "level": "INFO",
         "headline": source["headline"],
-        "image_path": str(image_path),
+        "selected_modality": "image" if visual_artifact else "text",
+        "image_path": str(image_path) if image_path else None,
         "html_path": str(html_path),
         "detail_html_path": str(detail_html_path),
-        "content_hash": content_hash(caption, report_text, canonical_json(visual_artifact["bundle"])),
+        "content_hash": content_hash(caption, report_text, canonical_json(bundle or source)),
         "caption_chars": visible_html_len(caption),
         "source": source["source"],
         "source_timestamp": source["timestamp"],
         "render_timestamp": source["timestamp"],
         "version": source["version"],
         "delivery": delivery if delivery is not None else ("dry_run" if dry_run else "pending"),
-        "render_engine": visual_artifact["render_engine"],
-        "font_warning": visual_artifact["font_warning"],
-        "visual_spec": visual_artifact["bundle"]["visual_spec"],
-        "render_spec": visual_artifact["bundle"]["render_spec"],
+        "render_engine": visual_artifact["render_engine"] if visual_artifact else "telegram-html",
+        "font_warning": visual_artifact["font_warning"] if visual_artifact else None,
+        "visual_spec": bundle["visual_spec"] if bundle else None,
+        "render_spec": bundle["render_spec"] if bundle else None,
         "source_payload": source,
-        "source_binding_validation": visual_artifact["validation"],
+        "source_binding_validation": visual_artifact["validation"] if visual_artifact else None,
     }
     write_json(json_path, outbox)
     return {
-        "image": str(image_path),
+        "image": str(image_path) if image_path else None,
         "html": str(html_path),
+        "detail_html": str(detail_html_path),
         "json": str(json_path),
         "caption_chars": outbox["caption_chars"],
         "render_engine": outbox["render_engine"],
@@ -3634,17 +3834,18 @@ def send_message(token: str, chat_id: str, thread_id: int, text: str) -> dict[st
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if requests is not None:
-        try:
-            resp = requests.post(url, json=payload, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data.get("ok"):
-                raise RuntimeError(f"Telegram sendMessage failed: {data}")
-            return data
-        except Exception:  # noqa: BLE001
-            pass
-    return send_message_via_curl(url, chat_id, thread_id, text)
+    if requests is None:
+        return send_message_via_curl(url, chat_id, thread_id, text)
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram sendMessage failed: {data}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        error_text = str(exc).replace(token, "<redacted>")
+        raise RuntimeError(f"Telegram sendMessage request failed: {type(exc).__name__}: {error_text}") from exc
 
 
 def send_message_via_curl(url: str, chat_id: str, thread_id: int, text: str) -> dict[str, Any]:
@@ -3678,28 +3879,29 @@ def send_message_via_curl(url: str, chat_id: str, thread_id: int, text: str) -> 
 
 def send_photo(token: str, chat_id: str, thread_id: int, image_path: Path, caption: str) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    if requests is not None:
-        try:
-            with image_path.open("rb") as handle:
-                resp = requests.post(
-                    url,
-                    data={
-                        "chat_id": chat_id,
-                        "message_thread_id": str(thread_id),
-                        "parse_mode": "HTML",
-                        "caption": caption,
-                    },
-                    files={"photo": (image_path.name, handle, "image/png")},
-                    timeout=30,
-                )
-            resp.raise_for_status()
-            data = resp.json()
-            if not data.get("ok"):
-                raise RuntimeError(f"Telegram sendPhoto failed: {data}")
-            return data
-        except Exception:  # noqa: BLE001
-            pass
-    return send_photo_via_curl(url, chat_id, thread_id, image_path, caption)
+    if requests is None:
+        return send_photo_via_curl(url, chat_id, thread_id, image_path, caption)
+    try:
+        with image_path.open("rb") as handle:
+            resp = requests.post(
+                url,
+                data={
+                    "chat_id": chat_id,
+                    "message_thread_id": str(thread_id),
+                    "parse_mode": "HTML",
+                    "caption": caption,
+                },
+                files={"photo": (image_path.name, handle, "image/png")},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram sendPhoto failed: {data}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        error_text = str(exc).replace(token, "<redacted>")
+        raise RuntimeError(f"Telegram sendPhoto request failed: {type(exc).__name__}: {error_text}") from exc
 
 
 def send_photo_via_curl(url: str, chat_id: str, thread_id: int, image_path: Path, caption: str) -> dict[str, Any]:
@@ -3753,9 +3955,29 @@ def deliver_digest(
     }
 
 
-def run(args: argparse.Namespace) -> int:
+def _run_locked(args: argparse.Namespace) -> int:
     run_now = now_utc()
     collection = collect_signal_result(args.limit)
+    if collection.source_health.get("core_healthy") is False:
+        failure_payload = {
+            "timestamp": iso_now(),
+            "status": "source_unavailable",
+            "dry_run": args.dry_run,
+            "candidate_count": collection.raw_candidate_count,
+            "eligible_count": 0,
+            "source_counts": collection.source_counts,
+            "source_health": collection.source_health,
+        }
+        write_json(LATEST_PATH, failure_payload)
+        append_jsonl(HISTORY_PATH, failure_payload)
+        print(
+            "POLYMARKET_SOURCE_UNAVAILABLE "
+            f"attempts={collection.source_health.get('attempt_count', 0)} "
+            f"failures={collection.source_health.get('failure_count', 0)}",
+            file=sys.stderr,
+        )
+        return 2
+
     signals = collection.signals
     selected, suppressed = select_sendable(signals, force=args.force)
     display_seen = {} if args.force else load_display_seen()
@@ -3788,6 +4010,7 @@ def run(args: argparse.Namespace) -> int:
         "source_status_counts": dict(source_status_counts),
         "rejected_by_reason": dict(rejected_by_reason),
         "source_counts": collection.source_counts,
+        "source_health": collection.source_health,
         "selected": [signal_to_dict(signal) for signal in selected],
         "top_candidates": [signal_to_dict(signal) for signal in signals[:12]],
         "display_items": [
@@ -3814,6 +4037,7 @@ def run(args: argparse.Namespace) -> int:
                 "strong_signal_count": strong_count,
                 "display_recent_suppressed_count": recent_display_suppressed_count,
                 "top_score": round(signals[0].score, 2) if signals else None,
+                "source_health": collection.source_health,
             },
         )
         print(
@@ -3833,6 +4057,7 @@ def run(args: argparse.Namespace) -> int:
                 "eligible_count": len(signals),
                 "display_count": display_count,
                 "display_recent_suppressed_count": recent_display_suppressed_count,
+                "source_health": collection.source_health,
             },
         )
         print(
@@ -3855,6 +4080,11 @@ def run(args: argparse.Namespace) -> int:
         eligible_count=len(signals),
         display_sections=display_sections,
     )
+    visual_source_payload = build_visual_source_payload(
+        digest_items,
+        collection.raw_candidate_count,
+        len(signals),
+    )
     visual_artifact: dict[str, Any] | None = None
     visual_error: dict[str, str] | None = None
     if not args.no_image:
@@ -3863,19 +4093,17 @@ def run(args: argparse.Namespace) -> int:
                 digest_items,
                 collection.raw_candidate_count,
                 len(signals),
+                source_payload=visual_source_payload,
             )
         except Exception as exc:  # noqa: BLE001
             visual_error = {"type": type(exc).__name__, "message": str(exc)}
     chart_path = Path(visual_artifact["path"]) if visual_artifact else None
-    outbox_evidence = (
-        write_visual_outbox(
-            visual_artifact,
-            caption,
-            report_text,
-            dry_run=args.dry_run,
-        )
-        if visual_artifact
-        else None
+    outbox_evidence = write_visual_outbox(
+        visual_artifact,
+        caption,
+        report_text,
+        dry_run=args.dry_run,
+        source_payload=visual_source_payload,
     )
     latest_payload["visual"] = {
         "selected_modality": "image" if visual_artifact else "text",
@@ -3899,6 +4127,7 @@ def run(args: argparse.Namespace) -> int:
                 "display_count": display_count,
                 "display_by_section": {section_key: len(items) for section_key, items in display_sections.items()},
                 "display_recent_suppressed_count": recent_display_suppressed_count,
+                "source_health": collection.source_health,
                 "digest_items": [
                     digest_item_to_dict(section_key, item)
                     for section_key, item in digest_items
@@ -3947,6 +4176,7 @@ def run(args: argparse.Namespace) -> int:
 
     env = load_env()
     token, chat_id, thread_id = telegram_target(env)
+    delivery_reserved_at = mark_digest_pending(digest_items)
     try:
         delivery = deliver_digest(
             token,
@@ -3968,21 +4198,24 @@ def run(args: argparse.Namespace) -> int:
                 "eligible_count": len(signals),
                 "selected_count": len(selected),
                 "selected": [signal_to_dict(signal) for signal in selected],
+                "source_health": collection.source_health,
+                "delivery_reserved_at": delivery_reserved_at,
+                "delivery_state": "pending",
             },
         )
         raise
 
     pushed_signals = [item.representative for _section_key, item in digest_items]
-    mark_digest_sent(digest_items)
+    mark_digest_sent(digest_items, sent_at=delivery_reserved_at)
     mark_sent(pushed_signals)
-    if visual_artifact:
-        outbox_evidence = write_visual_outbox(
-            visual_artifact,
-            caption,
-            report_text,
-            dry_run=False,
-            delivery=delivery,
-        )
+    outbox_evidence = write_visual_outbox(
+        visual_artifact,
+        caption,
+        report_text,
+        dry_run=False,
+        delivery=delivery,
+        source_payload=visual_source_payload,
+    )
     latest_payload["delivery"] = delivery
     latest_payload["visual"]["outbox"] = outbox_evidence
     write_json(LATEST_PATH, latest_payload)
@@ -3999,6 +4232,7 @@ def run(args: argparse.Namespace) -> int:
             "display_count": display_count,
             "display_by_section": {section_key: len(items) for section_key, items in display_sections.items()},
             "display_recent_suppressed_count": recent_display_suppressed_count,
+            "source_health": collection.source_health,
             "delivery": delivery,
             "chat_id": chat_id,
             "message_thread_id": thread_id,
@@ -4037,6 +4271,11 @@ def run(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    with single_instance_lock(RUN_LOCK_PATH):
+        return _run_locked(args)
 
 
 def build_parser() -> argparse.ArgumentParser:

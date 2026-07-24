@@ -1,5 +1,6 @@
 .DS_Store
-.env
+.env*
+!.env.example
 .pytest_cache/
 .venv/
 __pycache__/
@@ -8,3 +9,4 @@ __pycache__/
 outbox/
 state/*.json
 state/*.jsonl
+state/*.lock

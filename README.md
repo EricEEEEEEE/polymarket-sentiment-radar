@@ -26,11 +26,13 @@
 - 过滤已经过期、即将失效、流动性不足或语义不清楚的事件
 - 将事件整理为六大板块，并优先选择三个不同板块的头版内容
 - 将英文市场问题转换为更容易理解的中文事件描述
-- 同时显示事件、主要选项概率、24 小时变化和成交量
-- 只记录真正推送过的内容，七天内不重复推送同一故事
+- 同时显示事件、主要选项概率、24 小时变化和真实的 24 小时成交量
+- 发送前预留、成功后确认，七天内不重复推送同一故事
 - 过滤低成交赛事、精确比分和发帖数量等低价值噪音
 - 每天只发送一张主视觉卡片和三条摘要，避免长篇信息轰炸
-- 生成可审计的 PNG、HTML 和 JSON outbox 产物
+- 图片模式生成 PNG、HTML 和 JSON outbox；文字 fallback 仍生成 HTML 和 JSON
+- 所有核心数据源失败时非零退出，让 Supervisor、cron 或 systemd 能识别故障
+- 使用单实例锁、原子状态写入和发送前预留，降低并发、崩溃和超时造成的重复推送
 
 ## 它不会做什么
 
@@ -58,7 +60,7 @@ Telegram caption 再补充另外两个不同板块的事件。完整六板块报
 
 ## 快速开始
 
-要求：Python 3.10+。
+要求：Python 3.10–3.13。
 
 ```bash
 git clone https://github.com/EricEEEEEEE/polymarket-sentiment-radar.git
@@ -90,6 +92,7 @@ python scripts/polymarket_news_radar.py --dry-run
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 ```
 
 填写：
@@ -107,6 +110,8 @@ python scripts/polymarket_news_radar.py
 ```
 
 建议先确认 dry-run 内容和图片，再用 cron、systemd 或 Supervisor 安排每日执行。调度属于部署层，本仓库不会擅自修改系统服务。
+
+正式发送会在调用 Telegram 前将入选故事标记为 `pending`。如果进程在发送期间崩溃或遇到无法判断是否送达的网络超时，`pending` 记录继续参与七天去重，以避免下一次运行重复发送；对应失败会写入 history 并以非零状态退出。
 
 ## 常用参数
 
@@ -136,6 +141,8 @@ Polymarket Gamma API
 Telegram + PNG/HTML/JSON outbox
 ```
 
+文字 fallback 不生成 PNG，但始终保留 HTML、详细 HTML 和 JSON 审计记录。
+
 ## 项目结构
 
 ```text
@@ -157,13 +164,17 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-测试覆盖过期事件、截止时间、中文标题、六板块归类、故事聚类、跨板块多样性、七天去重、单消息发送、长标题、缺失变化值、极端概率和 source binding。
+测试覆盖过期事件、截止时间、中文标题、六板块归类、故事聚类、跨板块多样性、七天去重、真实 24 小时成交量、全源故障退出、单实例锁、损坏状态保护、Telegram 模糊超时、文字 fallback outbox、单消息发送、长标题、缺失变化值、极端概率和 source binding。
 
 ## 重要说明
 
 预测市场价格反映参与者在特定时间的交易行为，可能受到流动性、参与者结构、规则设计和短期叙事影响。它适合用来观察情绪与分歧，不适合作为事实判断或单独的投资依据。
 
 本项目与 Polymarket 无隶属或合作关系，仅使用其公开接口进行只读研究。
+
+## License
+
+[MIT](LICENSE)
 
 ## English summary
 
