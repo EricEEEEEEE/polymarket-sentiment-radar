@@ -69,6 +69,13 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
+Linux 服务器还需要 CJK 字体：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+```
+
 先运行只读 dry-run：
 
 ```bash
