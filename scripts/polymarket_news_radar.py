@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+import time
 import urllib.parse
 import urllib.request
 import warnings
@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape, unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
@@ -40,41 +40,89 @@ ENV_PATH = ROOT / ".env"
 STATE_DIR = ROOT / "state"
 OUTBOX_DIR = ROOT / "outbox"
 HISTORY_PATH = STATE_DIR / "polymarket_news_radar_history.jsonl"
-SEEN_PATH = STATE_DIR / "polymarket_news_radar_seen.json"
 DISPLAY_SEEN_PATH = STATE_DIR / "polymarket_news_radar_display_seen.json"
 LATEST_PATH = STATE_DIR / "polymarket_news_radar_latest.json"
+TRANSLATION_CACHE_PATH = STATE_DIR / "polymarket_news_radar_translations.json"
+SOURCE_ALERT_STATE_PATH = STATE_DIR / "polymarket_news_radar_source_alert.json"
+PROBE_SNAPSHOT_PATH = STATE_DIR / "polymarket_news_radar_probe_snapshot.json"
 RUN_LOCK_PATH = STATE_DIR / "polymarket_news_radar.lock"
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-USER_AGENT = "fab-polymarket-news-radar/3.1"
-RADAR_VERSION = "V3.1"
+USER_AGENT = "fab-polymarket-news-radar/3.4"
+RADAR_VERSION = "V3.4"
 
-MIN_VOLUME_24H = 25_000.0
-SEND_SCORE = 68.0
+# Recalibrated 2026-07-25 on the population this penalty actually sees: 1007
+# eligible signals out of 1405 raw candidates, replayed offline from one cached
+# Gamma snapshot so every variant scores byte-identical market data.
+# Real 24h volume is a long tail sitting on a floor of zeros:
+#   p50 $0 · p60 $35 · p70 $1,012 · p75 $3,316 · p85 $17,075 · p90 $26,337
+# V3.0's broken definition (which folded cumulative lifetime volume into the 24h
+# number) at $25k left 35.9% of signals penalty-free. Under the corrected
+# definition $1,000 leaves 30.2% — the closest practical match, so fixing the
+# definition does not silently demote a third of the board. It is also p70, i.e.
+# "there was any real trading at all today", and it is deliberately the same
+# line as DIVERSITY_MIN_VOLUME_24H so that "thin market" means one thing here.
+# Honest caveat: this knob does not move the output. Replaying the same snapshot
+# at 0 / 2k / 5k / 10k / 25k / 100k / 2M gives identical eligible, displayed,
+# strict and pushed counts and a byte-identical front page — the penalized tail
+# is already excluded by the hard volume gate and the score floors. The value is
+# chosen to state intent correctly, not because it changes what gets shown.
+MIN_VOLUME_24H = 1_000.0
 DISPLAY_SCORE = 45.0
-MAX_SEND_ITEMS = 6
-COOLDOWN_HOURS = 12
+MAX_CAPTION_SIGNALS = 6
 DISPLAY_COOLDOWN_HOURS = 24 * 7
 DISPLAY_SEEN_RETENTION_HOURS = 24 * 45
-SIGNIFICANT_SCORE_INCREASE = 15.0
-SIGNIFICANT_PROB_MOVE = 0.05
 DEADLINE_GRACE_HOURS = 2.0
 MARKET_LOOKAHEAD_DAYS = 14
 MARKET_EXTENDED_LOOKAHEAD_DAYS = 90
-KEYSET_EVENT_PAGES = 2
+# Gamma clamps every limit to 100 server-side (changelog 2026-05-14), so depth
+# must come from pagination: 3 pages × 100 restores the coverage the pre-clamp
+# limit=120 design intended, for ~3 extra requests (~2-4s) per run.
+KEYSET_EVENT_PAGES = 3
 KEYSET_MARKET_PAGES = 2
 PUBLIC_SEARCH_LIMIT_PER_TYPE = 8
+FETCH_RETRY_DELAY_SECONDS = 2.5
 DISPLAY_FALLBACK_SCORE = 35.0
 DIVERSITY_DISPLAY_SCORE = 18.0
 DIVERSITY_MIN_VOLUME_24H = 1_000.0
 DIGEST_MAIN_ITEMS = 3
 DIGEST_CAPTION_MAX_CHARS = 900
 DIGEST_MIN_VOLUME_24H = 25_000.0
+# Front-page sports bar. This gate is applied to *displayed* items, not to the
+# whole candidate set, and display is ranked by score rather than volume: on the
+# 2026-07-25 snapshot the best displayed sports item was $77,486 of real 24h
+# volume, so $1M and $300k both keep sports off the front page that day. $300k
+# is still the better number because it is reachable in principle — sports does
+# produce $1M+ markets (observed max $1,063,310) and those can surface on a big
+# match day — whereas $1M against the corrected definition was set high enough
+# to be a permanent lockout rather than a high bar. Not yet observed admitting
+# sports on any real day; revisit if sports never fronts by the World Cup.
+DIGEST_SPORTS_MIN_VOLUME_24H = 300_000.0
 TARGET_DISPLAY_ITEMS = 18
 BASE_SECTION_DISPLAY_ITEMS = 3
 MAX_SECTION_DISPLAY_ITEMS = 4
 SECTION_CANDIDATE_POOL_ITEMS = 60
+# A section this thin has nothing to be picky with, so the score floor drops to
+# the fallback tier rather than leaving the section empty.
+THIN_SECTION_ITEMS = 3
 SGT = timezone(timedelta(hours=8))
+
+# LLM title translation (display-only; never feeds scoring or eligibility).
+LLM_MODEL_DEFAULT = "gemini-2.5-flash"
+# Measured 2026-07-25 against gemini-2.5-flash on the LAN: ~1.1s per title, so a
+# single 24-title request overshot a 25s timeout. Chunking keeps each request
+# comfortably inside the timeout and lets a late chunk fail without discarding
+# the ones that already succeeded.
+LLM_TIMEOUT = 45
+LLM_MAX_TITLES = 24
+LLM_BATCH_SIZE = 8
+LLM_MAX_TITLE_CHARS = 220
+TRANSLATION_CACHE_MAX_ENTRIES = 4_000
+TRANSLATION_CACHE_TTL_DAYS = 60
+
+# History rotation. The radar appends one record per run forever otherwise.
+HISTORY_MAX_BYTES = 4 * 1024 * 1024
+HISTORY_KEEP_RECORDS = 400
 
 
 @dataclass(frozen=True)
@@ -339,6 +387,15 @@ SECTION_DEFS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "🏟️ 体育文化",
         ("sports", "entertainment_culture"),
     ),
+    # Last on purpose: the display allocator walks sections in order and stops
+    # at TARGET_DISPLAY_ITEMS, so on a full board this tail section only keeps
+    # what the six core sections left over — and when it has no candidates the
+    # top-up loop hands its slots straight back to them.
+    (
+        "society_science",
+        "🔬 社会科学",
+        ("society_weather_health_science", "other"),
+    ),
 )
 
 CATEGORY_TO_SECTION = {
@@ -366,6 +423,7 @@ SECTION_COLOR_BLOCKS = {
     "tech_business": "🟪",
     "politics_policy": "🟥",
     "sports_culture": "🟧",
+    "society_science": "🟫",
 }
 
 SECTION_INTEREST_BONUS = {
@@ -375,6 +433,10 @@ SECTION_INTEREST_BONUS = {
     "tech_business": 12.0,
     "politics_policy": 8.0,
     "sports_culture": -20.0,
+    # Neutral: society/science stories get no standing boost, so only a
+    # genuinely high raw score (major hurricane, pandemic declaration, a Nobel
+    # with market heat) can reach the digest.
+    "society_science": 0.0,
 }
 
 STORY_INTEREST_ADJUSTMENTS = {
@@ -419,6 +481,7 @@ VISUAL_SECTION_ACCENTS = {
     "tech_business": "#7e22ce",
     "politics_policy": "#b91c1c",
     "sports_culture": "#c2410c",
+    "society_science": "#0f766e",
 }
 
 NUMBER_BADGES = ("1️⃣", "2️⃣", "3️⃣")
@@ -480,18 +543,17 @@ DISCOVERY_QUERIES_BY_SECTION: dict[str, tuple[str, ...]] = {
         "Oscars",
         "movie",
     ),
+    "society_science": (
+        "hurricane",
+        "earthquake",
+        "pandemic",
+        "outbreak",
+        "heat wave",
+        "Nobel",
+    ),
 }
 
 DISPLAY_TRANSLATION_STATUSES = {"ok", "needs_review"}
-CORE_FETCH_SOURCES = frozenset(
-    {
-        "events_legacy",
-        "events_keyset",
-        "markets_legacy",
-        "markets_keyset",
-    }
-)
-_ACTIVE_LOCK_PATHS: set[Path] = set()
 
 
 @dataclass
@@ -523,15 +585,14 @@ class Signal:
     event_url: str
     score: float
     reason: str
-    fingerprint: str = field(init=False)
+    # Filled in after scoring by the LLM translation pass. Empty means the rule
+    # translator's output is what gets displayed.
+    title_cn_override: str = ""
+    translation_engine: str = "rule"
 
-    def __post_init__(self) -> None:
-        prob_bucket = "na" if self.probability is None else f"{round(self.probability / 0.05) * 5:.0f}"
-        object.__setattr__(
-            self,
-            "fingerprint",
-            f"{self.event_id}:{self.market_id}:{self.category.key}:{prob_bucket}",
-        )
+    @property
+    def market_title_cn(self) -> str:
+        return market_title_cn(self)
 
 
 @dataclass
@@ -541,42 +602,6 @@ class CollectionResult:
     raw_candidate_count: int
     source_counts: dict[str, int]
     source_health: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class FetchDiagnostics:
-    attempts: Counter[str] = field(default_factory=Counter)
-    successes: Counter[str] = field(default_factory=Counter)
-    failures: list[dict[str, str]] = field(default_factory=list)
-
-    def record_attempt(self, source: str) -> None:
-        self.attempts[source] += 1
-
-    def record_success(self, source: str) -> None:
-        self.successes[source] += 1
-
-    def record_failure(self, source: str, exc: Exception) -> None:
-        self.failures.append(
-            {
-                "source": source,
-                "error_type": type(exc).__name__,
-                "error": clean_text(str(exc), 240),
-            }
-        )
-
-    def snapshot(self) -> dict[str, Any]:
-        core_success_count = sum(self.successes[source] for source in CORE_FETCH_SOURCES)
-        return {
-            "core_healthy": core_success_count > 0,
-            "partial_failure": bool(self.failures),
-            "attempt_count": sum(self.attempts.values()),
-            "success_count": sum(self.successes.values()),
-            "failure_count": len(self.failures),
-            "core_success_count": core_success_count,
-            "source_attempts": dict(self.attempts),
-            "source_successes": dict(self.successes),
-            "failures": self.failures[:20],
-        }
 
 
 @dataclass(frozen=True)
@@ -636,7 +661,7 @@ def load_env(path: Path = ENV_PATH) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
         return env
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -651,66 +676,30 @@ def read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # Fail closed: silently resetting corrupted state would re-send every
+        # story the cooldown file was suppressing.
         raise RuntimeError(f"Invalid JSON state: {path}") from exc
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-
-
 def write_json(path: Path, payload: Any) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def write_text(path: Path, text: str) -> None:
-    atomic_write_text(path, text)
-
-
-def visible_html_len(value: str) -> int:
-    return len(unescape(re.sub(r"<[^>]+>", "", value)))
-
-
-def content_hash(*values: str) -> str:
-    digest = hashlib.sha256()
-    for value in values:
-        digest.update(value.encode("utf-8"))
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    # State files are read back by the next run; a crash mid-write must never
+    # leave truncated JSON behind, so write to a sibling temp file and rename.
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    tmp.replace(path)
+
+
+_ACTIVE_LOCK_PATHS: set[Path] = set()
 
 
 @contextmanager
 def single_instance_lock(path: Path):
+    """Refuse to run two radars against the same state directory at once."""
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved_path = path.resolve()
     if resolved_path in _ACTIVE_LOCK_PATHS:
         raise RuntimeError(f"Polymarket radar is already running: {path}")
-
     handle = path.open("a+", encoding="utf-8")
     try:
         try:
@@ -731,33 +720,95 @@ def single_instance_lock(path: Path):
             handle.close()
 
 
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def visible_html_len(value: str) -> int:
+    return len(unescape(re.sub(r"<[^>]+>", "", value)))
+
+
+def content_hash(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
 def fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> Any:
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(FETCH_RETRY_DELAY_SECONDS)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            # 4xx is a request-contract problem a retry cannot fix.
+            if error.code < 500 and error.code != 429:
+                raise
+            last_error = error
+        except (OSError, json.JSONDecodeError) as error:
+            last_error = error
+    raise last_error  # type: ignore[misc]  # loop always sets it before falling through
 
 
-def safe_fetch_json(
-    url: str,
-    params: dict[str, Any] | None = None,
-    timeout: int = 30,
-    *,
-    diagnostics: FetchDiagnostics | None = None,
-    source: str = "unknown",
-) -> Any | None:
-    if diagnostics is not None:
-        diagnostics.record_attempt(source)
+FETCH_FAILURES: list[dict[str, str]] = []
+# Wall-clock per fetch source, reset each run. A run spends its 75-110s mostly
+# inside the five Gamma pulls; source_timings in latest.json is the only place
+# that shows which source is the slow one when that budget drifts.
+FETCH_TIMINGS: dict[str, dict[str, Any]] = {}
+
+
+def reset_fetch_failures() -> None:
+    FETCH_FAILURES.clear()
+    FETCH_TIMINGS.clear()
+
+
+def timed_fetch(source: str, fetch: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    started = time.monotonic()
+    records = fetch()
+    FETCH_TIMINGS[source] = {
+        "seconds": round(time.monotonic() - started, 2),
+        "records": len(records),
+    }
+    return records
+
+
+def safe_fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> Any | None:
+    """Tolerate a single endpoint failing, but never lose the fact that it did.
+
+    Every caller treats None as "this source is empty", which is
+    indistinguishable from "Polymarket had nothing to say" unless the failure
+    is recorded here for the run-level health check.
+    """
     try:
-        payload = fetch_json(url, params=params, timeout=timeout)
+        return fetch_json(url, params=params, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
-        if diagnostics is not None:
-            diagnostics.record_failure(source, exc)
+        FETCH_FAILURES.append(
+            {
+                "endpoint": url.replace(GAMMA_BASE, ""),
+                "params": canonical_json(params or {})[:200],
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:200],
+            }
+        )
         return None
-    if diagnostics is not None:
-        diagnostics.record_success(source)
-    return payload
 
 
 def unique_records(records: list[dict[str, Any]], identity_fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -779,9 +830,6 @@ def fetch_keyset_pages(
     params: dict[str, Any],
     item_key: str,
     pages: int,
-    *,
-    diagnostics: FetchDiagnostics | None = None,
-    source: str,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -789,12 +837,7 @@ def fetch_keyset_pages(
         page_params = {key: value for key, value in params.items() if value not in (None, "")}
         if cursor:
             page_params["after_cursor"] = cursor
-        payload = safe_fetch_json(
-            f"{GAMMA_BASE}{endpoint}",
-            params=page_params,
-            diagnostics=diagnostics,
-            source=source,
-        )
+        payload = safe_fetch_json(f"{GAMMA_BASE}{endpoint}", params=page_params)
         if not isinstance(payload, dict):
             break
         items = payload.get(item_key)
@@ -837,6 +880,22 @@ def field_value(payload: dict[str, Any], *names: str) -> Any:
     return None
 
 
+MONTH_NUMBER_EN = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
 def infer_question_deadline(text: str, reference: datetime | None = None) -> tuple[datetime | None, str | None]:
     reference = reference or now_utc()
     patterns = (
@@ -848,13 +907,24 @@ def infer_question_deadline(text: str, reference: datetime | None = None) -> tup
         if not match:
             continue
         month_name, day_text, year_text = match.groups()
-        month = list(MONTHS_CN.keys()).index(month_name.lower()) + 1
-        year = int(year_text) if year_text else reference.year
+        month = MONTH_NUMBER_EN[month_name.lower()]
         day = int(day_text)
         # Polymarket date markets typically resolve at the end of the named
         # UTC date. This inferred date is only used when it is earlier than
         # the API deadline, preventing stale "by yesterday" markets.
-        return datetime(year, month, day, tzinfo=timezone.utc) + timedelta(days=1), "question.by_date"
+        candidates = [int(year_text)] if year_text else [reference.year, reference.year + 1]
+        for year in candidates:
+            try:
+                resolved = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(days=1)
+            except ValueError:
+                # e.g. "by February 30" — a malformed question must not crash the run.
+                continue
+            # "by January 5" read in December means next January, not one that
+            # already passed; without this the market looks expired and is
+            # silently dropped.
+            if year_text or resolved > reference:
+                return resolved, "question.by_date"
+        return None, None
     return None, None
 
 
@@ -969,7 +1039,6 @@ TERM_REPLACEMENTS_CN: tuple[tuple[str, str], ...] = (
     ("US x Iran", "美国与伊朗"),
     ("U.S.", "美国"),
     ("US", "美国"),
-    ("and", "与"),
     ("Iran", "伊朗"),
     ("Israel", "以色列"),
     ("Russia", "俄罗斯"),
@@ -1000,7 +1069,6 @@ TERM_REPLACEMENTS_CN: tuple[tuple[str, str], ...] = (
     ("agreement", "协议"),
     ("tweets", "发帖"),
     ("tweet", "发帖"),
-    ("post", "发布"),
     ("sign", "签署"),
     ("rate cut", "降息"),
     ("rate hike", "加息"),
@@ -1012,11 +1080,11 @@ TERM_REPLACEMENTS_CN: tuple[tuple[str, str], ...] = (
     ("reach", "触及"),
     ("hit", "触及"),
     ("win", "赢得"),
-    ("by", "截至"),
-    ("on", "在"),
-    ("from", "从"),
-    ("to", "至"),
-    ("in", "在"),
+    # No bare function words (by/on/from/to/in/and/post): \b treats a hyphen as
+    # a boundary, so "by-election" became "截至-election" and "Ninjas in
+    # Pyjamas" became "Ninjas在Pyjamas" in production. Titles they would have
+    # half-translated stay English-heavy either way and are already routed to
+    # the LLM pass via needs_review grading.
 )
 
 
@@ -1037,18 +1105,26 @@ def translate_months(text: str) -> str:
 
 def localize_market_text(text: str, limit: int = 92) -> str:
     localized = translate_months(clean_text(text, limit)).strip("? ")
-    localized = localized.replace(" - ", "至").replace(" – ", "至").replace(" — ", "至")
+    # "至" only when the dash sits between date-ish sides ("7月18日 - 25");
+    # a title separator like "(BO3) - The International" must keep its dash.
+    localized = re.sub(
+        r"(?<=[0-9日])\s*[–—-]\s*(?=\d|January|February|March|April|May|June|July"
+        r"|August|September|October|November|December)",
+        "至",
+        localized,
+        flags=re.IGNORECASE,
+    )
     localized = re.sub(r"\s+", " ", localized).strip()
     for src, dest in TERM_REPLACEMENTS_CN:
-        localized = re.sub(rf"\b{re.escape(src)}\b", dest, localized, flags=re.IGNORECASE)
+        # "US" stays case-sensitive: IGNORECASE would also hit the pronoun "us".
+        flags = 0 if src == "US" else re.IGNORECASE
+        localized = re.sub(rf"\b{re.escape(src)}\b", dest, localized, flags=flags)
     localized = localized.replace("# 发帖", "发帖数量").replace("#发帖", "发帖数量")
     localized = re.sub(r"^Will the price of (.+?) be 高于 (.+)$", r"\1价格是否高于 \2", localized, flags=re.IGNORECASE)
     localized = re.sub(r"^Will (.+?) be 高于 (.+)$", r"\1是否高于 \2", localized, flags=re.IGNORECASE)
     localized = re.sub(r"^Will (.+?) 触及 (.+)$", r"\1是否触及 \2", localized, flags=re.IGNORECASE)
     localized = re.sub(r"^Will (.+)$", r"是否\1", localized, flags=re.IGNORECASE)
     localized = localized.replace("$", "")
-    localized = re.sub(r"\s+在\s+", "在", localized)
-    localized = re.sub(r"\s+截至\s+", "截至", localized)
     return localized.strip()
 
 
@@ -1302,18 +1378,11 @@ def format_options_cn(signal: Signal, max_options: int = 4) -> str:
     return "选项：" + "｜".join(parts)
 
 
-def title_translation_status(title: str) -> str:
-    if re.search(r"是否(?:the|no|there|lebron|starmer)\b", title, flags=re.IGNORECASE):
-        return "needs_review"
-    if re.search(r"\b(Will|Game \d|Games Total|O/U|Both Teams Slay|Exact Score)\b", title, flags=re.IGNORECASE):
-        return "needs_review"
-    if re.search(
-        r"\b(the|there|rate cuts|interest rates|play for|out by| dip | in June| be | for | customers| agree | unfreeze| enrichment| Group )\b",
-        title,
-        flags=re.IGNORECASE,
-    ):
-        return "needs_review"
-    allowed_identifiers = {
+# English tokens a Chinese title may legitimately keep. Shared by the quality
+# check below and by the LLM prompt, so the two cannot drift into disagreeing
+# about what "translated" means.
+TRANSLATION_ALLOWED_IDENTIFIERS = frozenset(
+    {
         "ai",
         "btc",
         "cpi",
@@ -1340,13 +1409,29 @@ def title_translation_status(title: str) -> str:
         "xauusd",
         "xrp",
     }
+)
+
+
+def title_translation_status(title: str) -> str:
+    if re.search(r"是否(?:the|no|there|lebron|starmer)\b", title, flags=re.IGNORECASE):
+        return "needs_review"
+    if re.search(r"\b(Will|Game \d|Games Total|O/U|Both Teams Slay|Exact Score)\b", title, flags=re.IGNORECASE):
+        return "needs_review"
+    if re.search(
+        r"\b(the|there|rate cuts|interest rates|play for|out by| dip | in June| be | for | customers| agree | unfreeze| enrichment| Group )\b",
+        title,
+        flags=re.IGNORECASE,
+    ):
+        return "needs_review"
     english_tokens = {token.lower() for token in re.findall(r"[A-Za-z]{2,}", title)}
-    if english_tokens - allowed_identifiers:
+    if english_tokens - TRANSLATION_ALLOWED_IDENTIFIERS:
         return "needs_review"
     return "ok"
 
 
 def market_title_cn(signal: Signal) -> str:
+    if signal.title_cn_override:
+        return signal.title_cn_override
     raw = signal.market_title or signal.title
     lower = raw.lower()
     outcome = translate_outcome(signal.outcome)
@@ -1935,6 +2020,246 @@ def market_title_cn(signal: Signal) -> str:
     return localized
 
 
+LLM_SYSTEM_PROMPT = (
+    "你把 Polymarket 预测市场的英文标题翻译成简体中文短标题。"
+    "规则：1) 保留疑问命题语气，用「是否」句式，不要加问号；"
+    "2) 每条不超过 30 个汉字；3) 人名、球队名、机构名一律译成中文常用译名；"
+    "4) 只有这些缩写可以保留英文：{allowed}；5) 不要解释、不要加引号。"
+    '只输出 JSON 数组，元素形如 {{"i": 0, "cn": "……"}}，数量和顺序与输入一致。'
+)
+
+
+def llm_settings(env: dict[str, str]) -> dict[str, str] | None:
+    """Read the OpenAI-compatible endpoint from .env. Missing key or URL means "stay offline"."""
+    api_key = (env.get("CLIPROXY_API_KEY") or "").strip()
+    base = (env.get("CLIPROXY_BASE_URL") or "").strip().rstrip("/")
+    if not api_key or not base:
+        return None
+    return {
+        "base": base,
+        "api_key": api_key,
+        "model": (env.get("CLIPROXY_TRANSLATE_MODEL") or LLM_MODEL_DEFAULT).strip(),
+    }
+
+
+def translation_cache_key(text: str) -> str:
+    return hashlib.sha1(text.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def load_translation_cache() -> dict[str, dict[str, Any]]:
+    if not TRANSLATION_CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(TRANSLATION_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def prune_translation_cache(
+    cache: dict[str, dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Drop stale entries, then the oldest, so the file cannot grow without bound."""
+    now = now or now_utc()
+    cutoff = now - timedelta(days=TRANSLATION_CACHE_TTL_DAYS)
+    kept: list[tuple[datetime, str, dict[str, Any]]] = []
+    for key, entry in cache.items():
+        if not isinstance(entry, dict) or not entry.get("cn"):
+            continue
+        stamp = parse_datetime(entry.get("ts")) or now
+        if stamp < cutoff:
+            continue
+        kept.append((stamp, key, entry))
+    kept.sort(key=lambda row: row[0], reverse=True)
+    return {key: entry for _stamp, key, entry in kept[:TRANSLATION_CACHE_MAX_ENTRIES]}
+
+
+def save_translation_cache(cache: dict[str, dict[str, Any]]) -> None:
+    write_json(TRANSLATION_CACHE_PATH, prune_translation_cache(cache))
+
+
+def parse_llm_translation_payload(content: str) -> dict[int, str]:
+    """Pull {index: translation} out of a model reply that may be fenced."""
+    text = content.strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)\s*```", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return {}
+    try:
+        rows = json.loads(text[start : end + 1])
+    except Exception:  # noqa: BLE001
+        return {}
+    result: dict[int, str] = {}
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("i"))
+        except (TypeError, ValueError):
+            continue
+        translated = str(row.get("cn") or "").strip()
+        if translated:
+            result[index] = translated
+    return result
+
+
+def request_llm_translations(titles: list[str], settings: dict[str, str]) -> dict[int, str]:
+    """One batched call. Any failure returns {} and the rule translation stands."""
+    if not titles:
+        return {}
+    payload = {
+        "model": settings["model"],
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": LLM_SYSTEM_PROMPT.format(
+                    allowed=", ".join(sorted(TRANSLATION_ALLOWED_IDENTIFIERS)).upper()
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    [{"i": index, "en": title[:LLM_MAX_TITLE_CHARS]} for index, title in enumerate(titles)],
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{settings['base']}/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {settings['api_key']}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=LLM_TIMEOUT) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    choices = data.get("choices") or []
+    if not choices:
+        return {}
+    return parse_llm_translation_payload(str(choices[0].get("message", {}).get("content") or ""))
+
+
+def llm_translation_acceptable(candidate: str, english_title: str) -> bool:
+    """Reject anything that is not a plausible short Chinese title.
+
+    A model that echoes the English back, answers the question, or emits an
+    apology must not reach the card, so acceptance is checked here rather than
+    trusted from the response shape.
+    """
+    text = candidate.strip()
+    if not text or len(text) > 60:
+        return False
+    if not re.search(r"[㐀-鿿]", text):
+        return False
+    if text.lower() == english_title.strip().lower():
+        return False
+    cjk = len(re.findall(r"[㐀-鿿]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return cjk >= max(4, latin // 2)
+
+
+def apply_llm_translations(
+    signals: list[Signal],
+    enabled: bool = True,
+    env: dict[str, str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Give poorly rule-translated titles a second chance via the LLM.
+
+    Display-only by construction: scores were already computed and are left
+    untouched, so a better translation can promote an item past the display and
+    digest quality gates but can never reorder the ranking.
+    """
+    now = now or now_utc()
+    stats = {"attempted": 0, "cache_hits": 0, "llm_applied": 0, "rejected": 0, "status": "skipped"}
+    pending = [
+        signal
+        for signal in signals
+        if signal.translation_status != "ok"
+        # Categories without a display section can never surface anywhere, so
+        # spending LLM batch slots on their titles starves displayable ones.
+        and signal.category.key in CATEGORY_TO_SECTION
+    ]
+    if not enabled or not pending:
+        stats["status"] = "disabled" if not enabled else "not_needed"
+        return stats
+
+    settings = llm_settings(env if env is not None else load_env())
+    cache = load_translation_cache()
+    uncached: list[Signal] = []
+    for signal in pending:
+        english = signal.market_title or signal.title
+        entry = cache.get(translation_cache_key(english))
+        candidate = str((entry or {}).get("cn") or "")
+        if candidate and llm_translation_acceptable(candidate, english):
+            adopt_llm_translation(signal, candidate)
+            stats["cache_hits"] += 1
+        else:
+            uncached.append(signal)
+
+    if settings is None:
+        stats["status"] = "no_credential" if uncached else "cache_only"
+        return stats
+
+    batch = sorted(uncached, key=lambda signal: signal.score, reverse=True)[:LLM_MAX_TITLES]
+    if not batch:
+        stats["status"] = "cache_only"
+        return stats
+
+    stats["attempted"] = len(batch)
+    stamp = now.isoformat(timespec="seconds")
+    errors: list[str] = []
+    for start in range(0, len(batch), LLM_BATCH_SIZE):
+        chunk = batch[start : start + LLM_BATCH_SIZE]
+        titles = [signal.market_title or signal.title for signal in chunk]
+        try:
+            translations = request_llm_translations(titles, settings)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {str(exc)[:120]}")
+            continue
+        for index, signal in enumerate(chunk):
+            candidate = translations.get(index, "").strip()
+            english = titles[index]
+            if not candidate or not llm_translation_acceptable(candidate, english):
+                stats["rejected"] += 1
+                continue
+            adopt_llm_translation(signal, candidate)
+            cache[translation_cache_key(english)] = {
+                "cn": candidate,
+                "ts": stamp,
+                "model": settings["model"],
+            }
+            stats["llm_applied"] += 1
+
+    save_translation_cache(cache)
+    if errors:
+        stats["errors"] = errors[:4]
+        stats["status"] = "error" if not stats["llm_applied"] else "partial"
+    else:
+        stats["status"] = "ok"
+    return stats
+
+
+def adopt_llm_translation(signal: Signal, candidate: str) -> None:
+    signal.title_cn_override = candidate
+    signal.translation_engine = "llm"
+    # Re-graded against the same bar the rule translator faces, so the front
+    # page never gets easier just because a different engine wrote the title.
+    signal.translation_status = title_translation_status(candidate)
+
+
 def primary_probability(signal: Signal) -> float | None:
     for label, probability in signal.outcome_prices:
         if label.lower().strip() in {"yes", "y"}:
@@ -2371,14 +2696,12 @@ def days_until(value: str | None) -> float | None:
 
 
 def market_volume_24h(market: dict[str, Any]) -> float:
-    explicit_24h = [
-        fnum(market[key])
-        for key in ("volume24hr", "volume24hrClob", "volume24hrAmm")
-        if market.get(key) not in (None, "")
-    ]
-    if explicit_24h:
-        return max(explicit_24h)
-    return fnum(market.get("volume"))
+    # `volume` / `volumeNum` are cumulative lifetime totals; mixing them in here
+    # let dormant markets (Taiwan 2026: $0.03M in 24h, $39M lifetime) read as hot.
+    return max(
+        fnum(market.get("volume24hr")),
+        fnum(market.get("volume24hrClob")),
+    )
 
 
 def market_liquidity(market: dict[str, Any]) -> float:
@@ -2429,6 +2752,13 @@ def score_signal(
     volume_score = min(28.0, math.log10(max(volume, 1.0)) * 4.8)
     liquidity_score = min(12.0, math.log10(max(liquidity, 1.0)) * 2.0)
     move_score = min(32.0, max_move * 300.0)
+    # A 4-point odds move at 97% is resolution drift, not news; the same move
+    # at 50% is a real swing. Damp tail-probability moves unless they are big
+    # enough (>=8pt) to be news at any price level.
+    move_tail_damped = 0.0
+    if probability is not None and (probability < 0.05 or probability > 0.95) and max_move < 0.08:
+        move_score *= 0.6
+        move_tail_damped = 1.0
 
     ttl_score = 2.0
     if ttl is not None:
@@ -2497,6 +2827,7 @@ def score_signal(
         "volume": round(volume_score, 2),
         "liquidity": round(liquidity_score, 2),
         "move": round(move_score, 2),
+        "move_tail_damped": move_tail_damped,
         "ttl": round(ttl_score, 2),
         "freshness": round(freshness_score, 2),
         "category_weight": round(category.weight, 2),
@@ -2632,22 +2963,16 @@ def event_to_signal(event: dict[str, Any], now: datetime | None = None, source_s
     return signal
 
 
-def fetch_events_legacy(
-    limit: int,
-    diagnostics: FetchDiagnostics | None = None,
-) -> list[dict[str, Any]]:
+def fetch_events_legacy(limit: int) -> list[dict[str, Any]]:
     pages: list[list[dict[str, Any]]] = []
     for params in (
-        {"active": "true", "closed": "false", "order": "volume24hr", "ascending": "false", "limit": limit},
+        # min(limit, 100): Gamma clamps to 100 server-side; asking for more
+        # only overstates the coverage this call can actually deliver.
+        {"active": "true", "closed": "false", "order": "volume24hr", "ascending": "false", "limit": min(limit, 100)},
         {"active": "true", "closed": "false", "order": "updatedAt", "ascending": "false", "limit": min(limit, 60)},
         {"active": "true", "closed": "false", "order": "createdAt", "ascending": "false", "limit": min(limit, 60)},
     ):
-        payload = safe_fetch_json(
-            f"{GAMMA_BASE}/events",
-            params=params,
-            diagnostics=diagnostics,
-            source="events_legacy",
-        )
+        payload = safe_fetch_json(f"{GAMMA_BASE}/events", params=params)
         if isinstance(payload, list):
             pages.append(payload)
     return unique_records(
@@ -2656,33 +2981,21 @@ def fetch_events_legacy(
     )
 
 
-def fetch_events_keyset(
-    limit: int,
-    diagnostics: FetchDiagnostics | None = None,
-) -> list[dict[str, Any]]:
-    page_limit = min(500, max(limit, 100))
+def fetch_events_keyset(limit: int) -> list[dict[str, Any]]:
+    # Gamma clamps every limit to 100 server-side (API changelog 2026-05-14;
+    # verified live 2026-08-15: limit=120 and limit=500 both return 100 rows).
+    page_limit = 100
     records: list[dict[str, Any]] = []
     for params in (
         {"closed": "false", "order": "volume24hr", "ascending": "false", "limit": page_limit},
         {"closed": "false", "order": "updatedAt", "ascending": "false", "limit": page_limit},
         {"closed": "false", "order": "createdAt", "ascending": "false", "limit": page_limit},
     ):
-        records.extend(
-            fetch_keyset_pages(
-                "/events/keyset",
-                params,
-                "events",
-                KEYSET_EVENT_PAGES,
-                diagnostics=diagnostics,
-                source="events_keyset",
-            )
-        )
+        records.extend(fetch_keyset_pages("/events/keyset", params, "events", KEYSET_EVENT_PAGES))
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_public_search_events(
-    diagnostics: FetchDiagnostics | None = None,
-) -> list[dict[str, Any]]:
+def fetch_public_search_events() -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen_queries: set[str] = set()
     for queries in DISCOVERY_QUERIES_BY_SECTION.values():
@@ -2701,8 +3014,6 @@ def fetch_public_search_events(
                     "search_profiles": "false",
                 },
                 timeout=20,
-                diagnostics=diagnostics,
-                source="events_search",
             )
             if not isinstance(payload, dict):
                 continue
@@ -2712,14 +3023,11 @@ def fetch_public_search_events(
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_event_sources(
-    limit: int,
-    diagnostics: FetchDiagnostics | None = None,
-) -> dict[str, list[dict[str, Any]]]:
+def fetch_event_sources(limit: int) -> dict[str, list[dict[str, Any]]]:
     return {
-        "events_legacy": fetch_events_legacy(limit, diagnostics=diagnostics),
-        "events_keyset": fetch_events_keyset(limit, diagnostics=diagnostics),
-        "events_search": fetch_public_search_events(diagnostics=diagnostics),
+        "events_legacy": timed_fetch("events_legacy", lambda: fetch_events_legacy(limit)),
+        "events_keyset": timed_fetch("events_keyset", lambda: fetch_events_keyset(limit)),
+        "events_search": timed_fetch("events_search", fetch_public_search_events),
     }
 
 
@@ -2728,11 +3036,7 @@ def fetch_events(limit: int) -> list[dict[str, Any]]:
     return unique_records(records, ("id", "slug", "ticker"))
 
 
-def fetch_markets_legacy(
-    limit: int,
-    now: datetime | None = None,
-    diagnostics: FetchDiagnostics | None = None,
-) -> list[dict[str, Any]]:
+def fetch_markets_legacy(limit: int, now: datetime | None = None) -> list[dict[str, Any]]:
     now = now or now_utc()
     end_min = now.isoformat(timespec="seconds").replace("+00:00", "Z")
     end_max = (now + timedelta(days=MARKET_LOOKAHEAD_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -2743,7 +3047,8 @@ def fetch_markets_legacy(
             "closed": "false",
             "order": "volume24hr",
             "ascending": "false",
-            "limit": limit,
+            # Gamma clamps to 100 server-side; see fetch_events_legacy.
+            "limit": min(limit, 100),
             "end_date_min": end_min,
             "end_date_max": end_max,
         },
@@ -2757,12 +3062,7 @@ def fetch_markets_legacy(
             "end_date_max": end_max,
         },
     ):
-        payload = safe_fetch_json(
-            f"{GAMMA_BASE}/markets",
-            params=params,
-            diagnostics=diagnostics,
-            source="markets_legacy",
-        )
+        payload = safe_fetch_json(f"{GAMMA_BASE}/markets", params=params)
         if isinstance(payload, list):
             pages.append(payload)
     return unique_records(
@@ -2771,11 +3071,7 @@ def fetch_markets_legacy(
     )
 
 
-def fetch_markets_keyset(
-    limit: int,
-    now: datetime | None = None,
-    diagnostics: FetchDiagnostics | None = None,
-) -> list[dict[str, Any]]:
+def fetch_markets_keyset(limit: int, now: datetime | None = None) -> list[dict[str, Any]]:
     now = now or now_utc()
     end_min = now.isoformat(timespec="seconds").replace("+00:00", "Z")
     short_end_max = (now + timedelta(days=MARKET_LOOKAHEAD_DAYS)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -2811,27 +3107,14 @@ def fetch_markets_keyset(
             "include_tag": "true",
         },
     ):
-        records.extend(
-            fetch_keyset_pages(
-                "/markets/keyset",
-                params,
-                "markets",
-                KEYSET_MARKET_PAGES,
-                diagnostics=diagnostics,
-                source="markets_keyset",
-            )
-        )
+        records.extend(fetch_keyset_pages("/markets/keyset", params, "markets", KEYSET_MARKET_PAGES))
     return unique_records(records, ("id", "conditionId", "slug"))
 
 
-def fetch_market_sources(
-    limit: int,
-    now: datetime | None = None,
-    diagnostics: FetchDiagnostics | None = None,
-) -> dict[str, list[dict[str, Any]]]:
+def fetch_market_sources(limit: int, now: datetime | None = None) -> dict[str, list[dict[str, Any]]]:
     return {
-        "markets_legacy": fetch_markets_legacy(limit, now=now, diagnostics=diagnostics),
-        "markets_keyset": fetch_markets_keyset(limit, now=now, diagnostics=diagnostics),
+        "markets_legacy": timed_fetch("markets_legacy", lambda: fetch_markets_legacy(limit, now=now)),
+        "markets_keyset": timed_fetch("markets_keyset", lambda: fetch_markets_keyset(limit, now=now)),
     }
 
 
@@ -2874,11 +3157,59 @@ def event_from_market(market: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def assess_source_health(
+    event_sources: dict[str, list[dict[str, Any]]],
+    market_sources: dict[str, list[dict[str, Any]]],
+    raw_candidate_count: int,
+) -> dict[str, Any]:
+    """Classify a run as ok / degraded / failed from source coverage.
+
+    A single endpoint going dark is tolerable; every endpoint of one kind going
+    dark, or no candidates at all, means the radar is blind rather than quiet.
+    """
+    empty_events = sorted(name for name, records in event_sources.items() if not records)
+    empty_markets = sorted(name for name, records in market_sources.items() if not records)
+    empty_sources = empty_events + empty_markets
+    all_events_down = bool(event_sources) and len(empty_events) == len(event_sources)
+    all_markets_down = bool(market_sources) and len(empty_markets) == len(market_sources)
+
+    if raw_candidate_count == 0 or all_events_down or all_markets_down:
+        status = "failed"
+    elif empty_sources or FETCH_FAILURES:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    reasons: list[str] = []
+    if raw_candidate_count == 0:
+        reasons.append("no_candidates")
+    if all_events_down:
+        reasons.append("all_event_sources_empty")
+    if all_markets_down:
+        reasons.append("all_market_sources_empty")
+    if empty_sources:
+        reasons.append("empty_sources:" + ",".join(empty_sources))
+    if FETCH_FAILURES:
+        reasons.append(f"fetch_failures:{len(FETCH_FAILURES)}")
+
+    return {
+        "status": status,
+        "reasons": reasons,
+        "empty_sources": empty_sources,
+        "fetch_failure_count": len(FETCH_FAILURES),
+        "fetch_failures": list(FETCH_FAILURES[:12]),
+        "source_sizes": {
+            **{name: len(records) for name, records in event_sources.items()},
+            **{name: len(records) for name, records in market_sources.items()},
+        },
+    }
+
+
 def collect_signal_result(limit: int, now: datetime | None = None) -> CollectionResult:
     now = now or now_utc()
-    diagnostics = FetchDiagnostics()
-    event_sources = fetch_event_sources(limit, diagnostics=diagnostics)
-    market_sources = fetch_market_sources(limit, now=now, diagnostics=diagnostics)
+    reset_fetch_failures()
+    event_sources = fetch_event_sources(limit)
+    market_sources = fetch_market_sources(limit, now=now)
     future_markets = unique_records(
         [market for markets in market_sources.values() for market in markets],
         ("id", "conditionId", "slug"),
@@ -2932,22 +3263,18 @@ def collect_signal_result(limit: int, now: datetime | None = None) -> Collection
         "eligible": len(signals),
         "rejected": len(rejected),
     }
+    raw_candidate_count = source_counts["events"] + source_counts["markets"]
     return CollectionResult(
         signals=signals,
         rejected=rejected,
-        raw_candidate_count=source_counts["events"] + source_counts["markets"],
+        raw_candidate_count=raw_candidate_count,
         source_counts=source_counts,
-        source_health=diagnostics.snapshot(),
+        source_health=assess_source_health(event_sources, market_sources, raw_candidate_count),
     )
 
 
 def collect_signals(limit: int) -> list[Signal]:
     return collect_signal_result(limit).signals
-
-
-def load_seen() -> dict[str, dict[str, Any]]:
-    payload = read_json(SEEN_PATH, {})
-    return payload if isinstance(payload, dict) else {}
 
 
 def display_item_signal(item: dict[str, Any]) -> dict[str, Any]:
@@ -3029,13 +3356,9 @@ def prune_display_seen(
     return pruned
 
 
-def mark_digest_delivery_state(
-    digest_items: list[tuple[str, ReportItem]],
-    delivery_status: str,
-    sent_at: str | None = None,
-) -> str:
+def mark_digest_sent(digest_items: list[tuple[str, ReportItem]]) -> None:
     display_seen = prune_display_seen(load_display_seen())
-    ts = sent_at or iso_now()
+    ts = iso_now()
     for section_key, item in digest_items:
         display_seen[item.story_key] = {
             "sent_at": ts,
@@ -3043,84 +3366,48 @@ def mark_digest_delivery_state(
             "section": section_key,
             "score": round(item.score, 2),
             "representative_market_id": item.representative.market_id,
-            "delivery_status": delivery_status,
         }
     write_json(DISPLAY_SEEN_PATH, display_seen)
-    return ts
 
 
-def mark_digest_pending(digest_items: list[tuple[str, ReportItem]]) -> str:
-    return mark_digest_delivery_state(digest_items, "pending")
-
-
-def mark_digest_sent(
-    digest_items: list[tuple[str, ReportItem]],
-    sent_at: str | None = None,
-) -> None:
-    mark_digest_delivery_state(digest_items, "sent", sent_at=sent_at)
-
-
-def should_send(signal: Signal, seen: dict[str, dict[str, Any]], force: bool = False) -> tuple[bool, str]:
-    if force:
-        return True, "forced"
-    if signal.score < SEND_SCORE:
-        return False, "below_threshold"
-    prior = seen.get(signal.fingerprint)
-    if not prior:
-        return True, "new_signal"
-
-    sent_at = str(prior.get("sent_at") or "")
+def load_probe_snapshot() -> dict[str, Any]:
+    """Previous run's snapshot: {"ts": iso, "markets": {market_id: {"p": float}}}."""
+    if not PROBE_SNAPSHOT_PATH.exists():
+        return {}
     try:
-        prior_dt = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
-        if prior_dt.tzinfo is None:
-            prior_dt = prior_dt.replace(tzinfo=timezone.utc)
-        age_hours = (now_utc() - prior_dt).total_seconds() / 3600
-    except ValueError:
-        age_hours = COOLDOWN_HOURS + 1
-
-    prior_score = fnum(prior.get("score"))
-    prior_prob = prior.get("probability")
-    prob_move = 0.0
-    if prior_prob is not None and signal.probability is not None:
-        prob_move = abs(signal.probability - fnum(prior_prob))
-
-    if age_hours >= COOLDOWN_HOURS:
-        return True, "cooldown_elapsed"
-    if signal.score - prior_score >= SIGNIFICANT_SCORE_INCREASE:
-        return True, "score_increased"
-    if prob_move >= SIGNIFICANT_PROB_MOVE:
-        return True, "probability_moved"
-    return False, "cooldown"
+        payload = json.loads(PROBE_SNAPSHOT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
-def select_sendable(signals: list[Signal], force: bool = False) -> tuple[list[Signal], list[dict[str, str]]]:
-    seen = load_seen()
-    selected: list[Signal] = []
-    suppressed: list[dict[str, str]] = []
-    # Only the front page is eligible for Telegram. This prevents repeated
-    # invocations from draining lower-ranked candidates after the top batch
-    # enters cooldown.
-    for signal in signals[:MAX_SEND_ITEMS]:
-        send, reason = should_send(signal, seen, force=force)
-        if send and len(selected) < MAX_SEND_ITEMS:
-            selected.append(signal)
-        else:
-            suppressed.append({"fingerprint": signal.fingerprint, "reason": reason})
-    return selected, suppressed
+def probability_delta_since_last_run(
+    market_id: str, probability: float | None, previous_markets: dict[str, Any]
+) -> float | None:
+    if probability is None:
+        return None
+    previous = previous_markets.get(market_id)
+    prior = previous.get("p") if isinstance(previous, dict) else None
+    if not isinstance(prior, (int, float)):
+        return None
+    return round(probability - float(prior), 4)
 
 
-def mark_sent(signals: list[Signal]) -> None:
-    seen = load_seen()
-    ts = iso_now()
-    for signal in signals:
-        seen[signal.fingerprint] = {
-            "sent_at": ts,
-            "score": round(signal.score, 2),
-            "probability": signal.probability,
-            "title": signal.title,
-            "category": signal.category.key,
-        }
-    write_json(SEEN_PATH, seen)
+def write_probe_snapshot(signals: list[Signal], now: datetime) -> None:
+    # Rewritten wholesale each run, so markets that leave the eligible set fall
+    # out on their own. Observational only: the deltas are reported in
+    # latest.json and never feed back into scoring or display selection.
+    write_json(
+        PROBE_SNAPSHOT_PATH,
+        {
+            "ts": now.isoformat(timespec="seconds"),
+            "markets": {
+                signal.market_id: {"p": round(signal.probability, 4)}
+                for signal in signals
+                if signal.probability is not None
+            },
+        },
+    )
 
 
 def signal_to_dict(signal: Signal) -> dict[str, Any]:
@@ -3154,7 +3441,6 @@ def signal_to_dict(signal: Signal) -> dict[str, Any]:
         "event_url": signal.event_url,
         "score": round(signal.score, 2),
         "reason": signal.reason,
-        "fingerprint": signal.fingerprint,
     }
 
 
@@ -3188,24 +3474,38 @@ def report_items_by_section(
 ) -> dict[str, list[ReportItem]]:
     display_seen = display_seen or {}
     now = now or now_utc()
-    has_recent_seen = bool(display_seen)
-    ok_score_floor = DIVERSITY_DISPLAY_SCORE if has_recent_seen else DISPLAY_SCORE
-    review_score_floor = DIVERSITY_DISPLAY_SCORE if has_recent_seen else DISPLAY_FALLBACK_SCORE
-    candidates = {
-        section_key: [
-            item
-            for item in section_report_items(
-                signals,
-                category_keys,
-                limit=SECTION_CANDIDATE_POOL_ITEMS,
-                ok_score_floor=ok_score_floor,
-                review_score_floor=review_score_floor,
-            )
-            if not display_story_recently_seen(item.story_key, display_seen, now=now)
-            and (not has_recent_seen or item.total_volume_24h >= DIVERSITY_MIN_VOLUME_24H)
-        ]
-        for section_key, _section_label, category_keys in SECTION_DEFS
-    }
+
+    def pool(ok_floor: float, review_floor: float) -> dict[str, list[ReportItem]]:
+        return {
+            section_key: [
+                item
+                for item in section_report_items(
+                    signals,
+                    category_keys,
+                    limit=SECTION_CANDIDATE_POOL_ITEMS,
+                    ok_score_floor=ok_floor,
+                    review_score_floor=review_floor,
+                )
+                if not display_story_recently_seen(item.story_key, display_seen, now=now)
+                and item.total_volume_24h >= DIVERSITY_MIN_VOLUME_24H
+            ]
+            for section_key, _section_label, category_keys in SECTION_DEFS
+        }
+
+    # The score floor is real until a section cannot fill its slots. Relaxing it
+    # per-thin-section keeps a quiet corner of the market visible without
+    # lowering the bar for the sections that had plenty to choose from — the
+    # previous "any cooldown history at all" trigger was permanently on, which
+    # made DISPLAY_SCORE dead code.
+    strict = pool(DISPLAY_SCORE, DISPLAY_FALLBACK_SCORE)
+    relaxed = pool(DIVERSITY_DISPLAY_SCORE, DIVERSITY_DISPLAY_SCORE)
+    candidates: dict[str, list[ReportItem]] = {}
+    for section_key, _section_label, _category_keys in SECTION_DEFS:
+        items = list(strict.get(section_key, []))
+        if len(items) < THIN_SECTION_ITEMS:
+            present = {item.story_key for item in items}
+            items.extend(item for item in relaxed.get(section_key, []) if item.story_key not in present)
+        candidates[section_key] = items
     selected: dict[str, list[ReportItem]] = {section_key: [] for section_key, _label, _keys in SECTION_DEFS}
     used: set[str] = set()
 
@@ -3240,6 +3540,21 @@ def report_items_by_section(
             add_item(section_key, item)
 
     return {section_key: items for section_key, items in selected.items() if items}
+
+
+def strict_floor_item_count(sections: dict[str, list[ReportItem]]) -> int:
+    """Displayed items that cleared the strict floor, not the thin-section relaxation."""
+    total = 0
+    for items in sections.values():
+        for item in items:
+            floor = (
+                DISPLAY_SCORE
+                if item.representative.translation_status == "ok"
+                else DISPLAY_FALLBACK_SCORE
+            )
+            if item.score >= floor:
+                total += 1
+    return total
 
 
 def interest_score(item: ReportItem, section_key: str) -> float:
@@ -3303,7 +3618,7 @@ def digest_title_quality_ok(item: ReportItem, section_key: str | None = None) ->
     if any(token in title for token in ("该结果", "事件：", "是否是否")):
         return False
     if section_key == "sports_culture" and (
-        item.total_volume_24h < 1_000_000
+        item.total_volume_24h < DIGEST_SPORTS_MIN_VOLUME_24H
         or not any(keyword in title for keyword in DIGEST_MAJOR_SPORTS_KEYWORDS)
     ):
         return False
@@ -3569,9 +3884,8 @@ def render_visual_card(
     digest_items: list[tuple[str, ReportItem]],
     total_count: int,
     eligible_count: int,
-    source_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    source_payload = source_payload or build_visual_source_payload(digest_items, total_count, eligible_count)
+    source_payload = build_visual_source_payload(digest_items, total_count, eligible_count)
     if source_payload is None:
         return None
     script_dir = str(Path(__file__).resolve().parent)
@@ -3591,19 +3905,15 @@ def render_visual_card(
 
 
 def write_visual_outbox(
-    visual_artifact: dict[str, Any] | None,
+    visual_artifact: dict[str, Any],
     caption: str,
     report_text: str,
     *,
     dry_run: bool,
     delivery: Any = None,
-    source_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    source = visual_artifact["source_payload"] if visual_artifact else source_payload
-    if source is None:
-        raise RuntimeError("Outbox source payload unavailable")
-    image_path = Path(visual_artifact["path"]) if visual_artifact else None
-    bundle = visual_artifact["bundle"] if visual_artifact else None
+    source = visual_artifact["source_payload"]
+    image_path = Path(visual_artifact["path"])
     html_path = OUTBOX_DIR / "latest-polymarket-daily.html"
     detail_html_path = OUTBOX_DIR / "latest-polymarket-daily-detail.html"
     json_path = OUTBOX_DIR / "latest-polymarket-daily.json"
@@ -3614,29 +3924,27 @@ def write_visual_outbox(
         "job": "polymarket-daily",
         "level": "INFO",
         "headline": source["headline"],
-        "selected_modality": "image" if visual_artifact else "text",
-        "image_path": str(image_path) if image_path else None,
+        "image_path": str(image_path),
         "html_path": str(html_path),
         "detail_html_path": str(detail_html_path),
-        "content_hash": content_hash(caption, report_text, canonical_json(bundle or source)),
+        "content_hash": content_hash(caption, report_text, canonical_json(visual_artifact["bundle"])),
         "caption_chars": visible_html_len(caption),
         "source": source["source"],
         "source_timestamp": source["timestamp"],
         "render_timestamp": source["timestamp"],
         "version": source["version"],
         "delivery": delivery if delivery is not None else ("dry_run" if dry_run else "pending"),
-        "render_engine": visual_artifact["render_engine"] if visual_artifact else "telegram-html",
-        "font_warning": visual_artifact["font_warning"] if visual_artifact else None,
-        "visual_spec": bundle["visual_spec"] if bundle else None,
-        "render_spec": bundle["render_spec"] if bundle else None,
+        "render_engine": visual_artifact["render_engine"],
+        "font_warning": visual_artifact["font_warning"],
+        "visual_spec": visual_artifact["bundle"]["visual_spec"],
+        "render_spec": visual_artifact["bundle"]["render_spec"],
         "source_payload": source,
-        "source_binding_validation": visual_artifact["validation"] if visual_artifact else None,
+        "source_binding_validation": visual_artifact["validation"],
     }
     write_json(json_path, outbox)
     return {
-        "image": str(image_path) if image_path else None,
+        "image": str(image_path),
         "html": str(html_path),
-        "detail_html": str(detail_html_path),
         "json": str(json_path),
         "caption_chars": outbox["caption_chars"],
         "render_engine": outbox["render_engine"],
@@ -3662,8 +3970,9 @@ def recent_display_story_count(
     return sum(1 for story in stories if display_story_recently_seen(story, display_seen, now=now))
 
 
-def strong_signal_count(signals: list[Signal]) -> int:
-    return min(MAX_SEND_ITEMS, sum(1 for signal in signals if signal.score >= SEND_SCORE))
+def high_score_count(signals: list[Signal]) -> int:
+    """Funnel diagnostic: how many eligible signals clear the display bar."""
+    return sum(1 for signal in signals if signal.score >= DISPLAY_SCORE)
 
 
 def render_digest_caption(
@@ -3744,11 +4053,9 @@ def render_caption(
 def render_text_message(
     signals: list[Signal],
     total_count: int,
-    selected_count: int | None = None,
     eligible_count: int | None = None,
     display_sections: dict[str, list[ReportItem]] | None = None,
 ) -> str:
-    selected_count = len(signals) if selected_count is None else selected_count
     eligible_count = len(signals) if eligible_count is None else eligible_count
     display_sections = display_sections if display_sections is not None else report_items_by_section(signals)
     display_count = display_item_total(display_sections)
@@ -3825,6 +4132,144 @@ def telegram_target(env: dict[str, str]) -> tuple[str, str, int]:
     return token, chat_id, thread_id
 
 
+def monitor_target(env: dict[str, str]) -> tuple[str, str, int]:
+    """Failure alerts go to the main topic unless POLYMARKET_ALERT_TOPIC_ID overrides it."""
+    token, chat_id, thread_id = telegram_target(env)
+    alert_thread = env.get("POLYMARKET_ALERT_TOPIC_ID", "").strip()
+    if not alert_thread:
+        return token, chat_id, thread_id
+    try:
+        return token, chat_id, int(alert_thread)
+    except ValueError as exc:
+        raise RuntimeError("POLYMARKET_ALERT_TOPIC_ID must be an integer") from exc
+
+
+def alert_already_sent_today(kind: str, now: datetime) -> bool:
+    """One alert per failure kind per day — enough to notice, not enough to spam."""
+    today = now.astimezone(SGT).strftime("%Y-%m-%d")
+    state: dict[str, Any] = {}
+    if SOURCE_ALERT_STATE_PATH.exists():
+        try:
+            loaded = json.loads(SOURCE_ALERT_STATE_PATH.read_text(encoding="utf-8"))
+            state = loaded if isinstance(loaded, dict) else {}
+        except Exception:  # noqa: BLE001
+            state = {}
+    entry = state.get(kind)
+    already = isinstance(entry, dict) and entry.get("date") == today
+    if already:
+        entry["count"] = int(entry.get("count") or 1) + 1
+    else:
+        state[kind] = {"date": today, "count": 1, "last": now.isoformat(timespec="seconds")}
+    write_json(SOURCE_ALERT_STATE_PATH, state)
+    return already
+
+
+def notify_monitor(kind: str, text: str, dry_run: bool) -> dict[str, Any]:
+    """Best-effort alert to the Monitor topic. Never raises into the caller."""
+    now = now_utc()
+    if dry_run:
+        print(f"[MONITOR_ALERT_DRY_RUN] {kind}\n{text}")
+        return {"kind": kind, "status": "dry_run"}
+    if alert_already_sent_today(kind, now):
+        return {"kind": kind, "status": "deduped"}
+    try:
+        token, chat_id, thread_id = monitor_target(load_env())
+        result = send_message(token, chat_id, thread_id, text)
+        return {
+            "kind": kind,
+            "status": "sent",
+            "message_id": result.get("result", {}).get("message_id"),
+            "message_thread_id": thread_id,
+        }
+    except Exception as exc:  # noqa: BLE001
+        # The radar is already failing; a failing alert must not mask the
+        # original error by replacing it with its own traceback.
+        print(f"[MONITOR_ALERT_FAILED] {kind} {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return {"kind": kind, "status": "alert_failed", "error_type": type(exc).__name__}
+
+
+def notify_source_failure(source_health: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    reasons = ", ".join(source_health.get("reasons") or []) or "unknown"
+    empty = ", ".join(source_health.get("empty_sources") or []) or "-"
+    lines = [
+        "🔴 <b>Polymarket 雷达 · 数据源失效</b>",
+        f"时间：<code>{sgt_label()}</code> SGT",
+        f"原因：<code>{escape(reasons[:300])}</code>",
+        f"空源：<code>{escape(empty[:200])}</code>",
+        f"抓取失败次数：<code>{source_health.get('fetch_failure_count', 0)}</code>",
+        "",
+        "本轮已跳过推送并以退出码 1 结束。",
+    ]
+    return notify_monitor("source_failure", "\n".join(lines), dry_run)
+
+
+def notify_send_failure(exc: BaseException, dry_run: bool) -> dict[str, Any]:
+    lines = [
+        "🔴 <b>Polymarket 雷达 · Telegram 推送失败</b>",
+        f"时间：<code>{sgt_label()}</code> SGT",
+        f"异常：<code>{escape(type(exc).__name__)}</code>",
+        f"信息：<code>{escape(str(exc)[:300])}</code>",
+        "",
+        "本轮不写 display 冷却，下一轮会重试同一批故事。",
+    ]
+    return notify_monitor("send_failed", "\n".join(lines), dry_run)
+
+
+def rotate_history(path: Path, max_bytes: int = HISTORY_MAX_BYTES, keep: int = HISTORY_KEEP_RECORDS) -> bool:
+    """Keep the newest records once the append-only log crosses the size cap."""
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return False
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:  # noqa: BLE001
+        return False
+    if len(lines) <= keep:
+        return False
+    archive = path.with_suffix(path.suffix + ".1")
+    try:
+        path.replace(archive)
+        path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    """True only for failures curl could plausibly succeed at retrying.
+
+    A rejected payload (bad HTML, caption too long, wrong thread id) returns
+    the same 4xx no matter which client sends it, so retrying via curl only
+    hides the real error behind a second identical one.
+    """
+    if requests is not None:
+        transport = getattr(requests, "exceptions", None)
+        if transport is not None and isinstance(
+            exc,
+            (
+                getattr(transport, "ConnectionError", ()),
+                getattr(transport, "Timeout", ()),
+                getattr(transport, "SSLError", ()),
+                getattr(transport, "ProxyError", ()),
+            ),
+        ):
+            return True
+        http_error = getattr(getattr(requests, "exceptions", None), "HTTPError", None)
+        if http_error is not None and isinstance(exc, http_error):
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            return status is not None and status >= 500
+    return isinstance(exc, (OSError, TimeoutError))
+
+
+def redact_bot_token(text: str) -> str:
+    """Strip the bot token from error text before it reaches logs.
+
+    requests exceptions embed the full request URL, and the Telegram URL
+    carries the token in its path — re-raising that raw would leak the
+    credential into launchd err.log.
+    """
+    return re.sub(r"/bot[^/\s'\"]+", "/bot<redacted>", text)
+
+
 def send_message(token: str, chat_id: str, thread_id: int, text: str) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -3834,18 +4279,21 @@ def send_message(token: str, chat_id: str, thread_id: int, text: str) -> dict[st
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if requests is None:
-        return send_message_via_curl(url, chat_id, thread_id, text)
-    try:
-        resp = requests.post(url, json=payload, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram sendMessage failed: {data}")
-        return data
-    except Exception as exc:  # noqa: BLE001
-        error_text = str(exc).replace(token, "<redacted>")
-        raise RuntimeError(f"Telegram sendMessage request failed: {type(exc).__name__}: {error_text}") from exc
+    if requests is not None:
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegram sendMessage failed: {data}")
+            return data
+        except Exception as exc:  # noqa: BLE001
+            if not is_transport_error(exc):
+                error_text = redact_bot_token(str(exc).replace(token, "<redacted>"))
+                raise RuntimeError(
+                    f"Telegram sendMessage request failed: {type(exc).__name__}: {error_text}"
+                ) from exc
+    return send_message_via_curl(url, chat_id, thread_id, text)
 
 
 def send_message_via_curl(url: str, chat_id: str, thread_id: int, text: str) -> dict[str, Any]:
@@ -3870,7 +4318,10 @@ def send_message_via_curl(url: str, chat_id: str, thread_id: int, text: str) -> 
     ]
     resp = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if resp.returncode != 0:
-        raise RuntimeError(f"curl sendMessage failed: {resp.stderr.strip() or resp.stdout.strip()}")
+        raise RuntimeError(
+            "curl sendMessage failed: "
+            + redact_bot_token(resp.stderr.strip() or resp.stdout.strip())
+        )
     data = json.loads(resp.stdout)
     if not data.get("ok"):
         raise RuntimeError(f"Telegram sendMessage failed: {resp.stdout}")
@@ -3879,29 +4330,32 @@ def send_message_via_curl(url: str, chat_id: str, thread_id: int, text: str) -> 
 
 def send_photo(token: str, chat_id: str, thread_id: int, image_path: Path, caption: str) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    if requests is None:
-        return send_photo_via_curl(url, chat_id, thread_id, image_path, caption)
-    try:
-        with image_path.open("rb") as handle:
-            resp = requests.post(
-                url,
-                data={
-                    "chat_id": chat_id,
-                    "message_thread_id": str(thread_id),
-                    "parse_mode": "HTML",
-                    "caption": caption,
-                },
-                files={"photo": (image_path.name, handle, "image/png")},
-                timeout=30,
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram sendPhoto failed: {data}")
-        return data
-    except Exception as exc:  # noqa: BLE001
-        error_text = str(exc).replace(token, "<redacted>")
-        raise RuntimeError(f"Telegram sendPhoto request failed: {type(exc).__name__}: {error_text}") from exc
+    if requests is not None:
+        try:
+            with image_path.open("rb") as handle:
+                resp = requests.post(
+                    url,
+                    data={
+                        "chat_id": chat_id,
+                        "message_thread_id": str(thread_id),
+                        "parse_mode": "HTML",
+                        "caption": caption,
+                    },
+                    files={"photo": (image_path.name, handle, "image/png")},
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegram sendPhoto failed: {data}")
+            return data
+        except Exception as exc:  # noqa: BLE001
+            if not is_transport_error(exc):
+                error_text = redact_bot_token(str(exc).replace(token, "<redacted>"))
+                raise RuntimeError(
+                    f"Telegram sendPhoto request failed: {type(exc).__name__}: {error_text}"
+                ) from exc
+    return send_photo_via_curl(url, chat_id, thread_id, image_path, caption)
 
 
 def send_photo_via_curl(url: str, chat_id: str, thread_id: int, image_path: Path, caption: str) -> dict[str, Any]:
@@ -3913,20 +4367,25 @@ def send_photo_via_curl(url: str, chat_id: str, thread_id: int, image_path: Path
         "-X",
         "POST",
         url,
-        "-F",
+        # --form-string, not -F: a caption beginning with "@" or "<" would
+        # otherwise be read by curl as a file path to upload.
+        "--form-string",
         f"chat_id={chat_id}",
-        "-F",
+        "--form-string",
         f"message_thread_id={thread_id}",
-        "-F",
+        "--form-string",
         "parse_mode=HTML",
-        "-F",
+        "--form-string",
         f"caption={caption}",
         "-F",
         f"photo=@{image_path}",
     ]
     resp = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if resp.returncode != 0:
-        raise RuntimeError(f"curl sendPhoto failed: {resp.stderr.strip() or resp.stdout.strip()}")
+        raise RuntimeError(
+            "curl sendPhoto failed: "
+            + redact_bot_token(resp.stderr.strip() or resp.stdout.strip())
+        )
     data = json.loads(resp.stdout)
     if not data.get("ok"):
         raise RuntimeError(f"Telegram sendPhoto failed: {resp.stdout}")
@@ -3955,63 +4414,56 @@ def deliver_digest(
     }
 
 
+def run(args: argparse.Namespace) -> int:
+    with single_instance_lock(RUN_LOCK_PATH):
+        return _run_locked(args)
+
+
 def _run_locked(args: argparse.Namespace) -> int:
     run_now = now_utc()
+    probe_snapshot = load_probe_snapshot()
+    probe_markets = probe_snapshot.get("markets")
+    if not isinstance(probe_markets, dict):
+        probe_markets = {}
     collection = collect_signal_result(args.limit)
-    if collection.source_health.get("core_healthy") is False:
-        failure_payload = {
-            "timestamp": iso_now(),
-            "status": "source_unavailable",
-            "dry_run": args.dry_run,
-            "candidate_count": collection.raw_candidate_count,
-            "eligible_count": 0,
-            "source_counts": collection.source_counts,
-            "source_health": collection.source_health,
-        }
-        write_json(LATEST_PATH, failure_payload)
-        append_jsonl(HISTORY_PATH, failure_payload)
-        print(
-            "POLYMARKET_SOURCE_UNAVAILABLE "
-            f"attempts={collection.source_health.get('attempt_count', 0)} "
-            f"failures={collection.source_health.get('failure_count', 0)}",
-            file=sys.stderr,
-        )
-        return 2
-
     signals = collection.signals
-    selected, suppressed = select_sendable(signals, force=args.force)
+    source_health = collection.source_health
+    translation_stats = apply_llm_translations(signals, enabled=not args.no_llm, now=run_now)
     display_seen = {} if args.force else load_display_seen()
     display_sections = report_items_by_section(signals, display_seen=display_seen, now=run_now)
     display_count = display_item_total(display_sections)
     display_signals = display_representative_signals(display_sections)
     digest_items = digest_items_by_interest(display_sections)
-    caption_signals = selected or display_signals[:MAX_SEND_ITEMS] or signals[:MAX_SEND_ITEMS]
-    strong_count = strong_signal_count(signals)
+    caption_signals = display_signals[:MAX_CAPTION_SIGNALS] or signals[:MAX_CAPTION_SIGNALS]
+    high_count = high_score_count(signals)
     recent_display_suppressed_count = 0 if args.force else recent_display_story_count(signals, display_seen, now=run_now)
     eligible_by_section = Counter(CATEGORY_TO_SECTION.get(signal.category.key, signal.category.key) for signal in signals)
     translation_status_counts = Counter(signal.translation_status for signal in signals)
+    translation_engine_counts = Counter(signal.translation_engine for signal in signals)
     source_status_counts = Counter(signal.source_status for signal in signals)
     rejected_by_reason = Counter(str(item.get("reject_reason") or "unknown") for item in collection.rejected)
     latest_payload = {
         "timestamp": iso_now(),
+        "radar_version": RADAR_VERSION,
         "dry_run": args.dry_run,
         "candidate_count": collection.raw_candidate_count,
         "eligible_count": len(signals),
-        "selected_count": len(selected),
         "pushed_count": len(digest_items),
-        "strong_signal_count": strong_count,
-        "suppressed_count": len(suppressed),
+        "high_score_count": high_count,
         "display_target": TARGET_DISPLAY_ITEMS,
         "display_count": display_count,
+        "display_strict_floor_count": strict_floor_item_count(display_sections),
         "display_by_section": {section_key: len(items) for section_key, items in display_sections.items()},
         "display_recent_suppressed_count": recent_display_suppressed_count,
         "eligible_by_section": dict(eligible_by_section),
         "translation_status_counts": dict(translation_status_counts),
+        "translation_engine_counts": dict(translation_engine_counts),
+        "translation_llm": translation_stats,
         "source_status_counts": dict(source_status_counts),
         "rejected_by_reason": dict(rejected_by_reason),
         "source_counts": collection.source_counts,
-        "source_health": collection.source_health,
-        "selected": [signal_to_dict(signal) for signal in selected],
+        "source_timings": {source: dict(timing) for source, timing in FETCH_TIMINGS.items()},
+        "source_health": source_health,
         "top_candidates": [signal_to_dict(signal) for signal in signals[:12]],
         "display_items": [
             report_item_to_dict(item, section_key)
@@ -4024,7 +4476,47 @@ def _run_locked(args: argparse.Namespace) -> int:
         ],
         "rejected_candidates": collection.rejected[:80],
     }
+    delta_matched = 0
+    for display_item in latest_payload["display_items"]:
+        for display_market in display_item["display_markets"]:
+            delta = probability_delta_since_last_run(
+                display_market["market_id"], display_market["probability"], probe_markets
+            )
+            display_market["probability_delta_run"] = delta
+            if delta is not None:
+                delta_matched += 1
+    latest_payload["probe_snapshot"] = {
+        "previous_ts": probe_snapshot.get("ts"),
+        "previous_markets": len(probe_markets),
+        "display_markets_matched": delta_matched,
+    }
     write_json(LATEST_PATH, latest_payload)
+    rotate_history(HISTORY_PATH)
+
+    if source_health.get("status") == "failed":
+        # A blind run and a quiet market both produce zero pushes. Only this
+        # branch knows the difference, so it must be the loud one.
+        append_jsonl(
+            HISTORY_PATH,
+            {
+                "timestamp": latest_payload["timestamp"],
+                "status": "source_failure",
+                "candidate_count": collection.raw_candidate_count,
+                "eligible_count": len(signals),
+                "source_health": source_health,
+            },
+        )
+        notify_source_failure(source_health, dry_run=args.dry_run)
+        print(
+            "POLYMARKET_SOURCE_FAILURE "
+            f"candidates={collection.raw_candidate_count} "
+            f"reasons={','.join(source_health.get('reasons') or []) or 'unknown'}"
+        )
+        return 1
+
+    # Only a healthy run may advance the probability baseline: a blind run has
+    # an empty eligible set and would wipe the previous snapshot.
+    write_probe_snapshot(signals, run_now)
 
     if not display_count:
         append_jsonl(
@@ -4034,10 +4526,10 @@ def _run_locked(args: argparse.Namespace) -> int:
                 "status": "no_fresh_display",
                 "candidate_count": collection.raw_candidate_count,
                 "eligible_count": len(signals),
-                "strong_signal_count": strong_count,
+                "high_score_count": high_count,
                 "display_recent_suppressed_count": recent_display_suppressed_count,
+                "source_health_status": source_health.get("status"),
                 "top_score": round(signals[0].score, 2) if signals else None,
-                "source_health": collection.source_health,
             },
         )
         print(
@@ -4057,7 +4549,7 @@ def _run_locked(args: argparse.Namespace) -> int:
                 "eligible_count": len(signals),
                 "display_count": display_count,
                 "display_recent_suppressed_count": recent_display_suppressed_count,
-                "source_health": collection.source_health,
+                "source_health_status": source_health.get("status"),
             },
         )
         print(
@@ -4076,14 +4568,8 @@ def _run_locked(args: argparse.Namespace) -> int:
     report_text = render_text_message(
         signals,
         collection.raw_candidate_count,
-        selected_count=strong_count,
         eligible_count=len(signals),
         display_sections=display_sections,
-    )
-    visual_source_payload = build_visual_source_payload(
-        digest_items,
-        collection.raw_candidate_count,
-        len(signals),
     )
     visual_artifact: dict[str, Any] | None = None
     visual_error: dict[str, str] | None = None
@@ -4093,17 +4579,19 @@ def _run_locked(args: argparse.Namespace) -> int:
                 digest_items,
                 collection.raw_candidate_count,
                 len(signals),
-                source_payload=visual_source_payload,
             )
         except Exception as exc:  # noqa: BLE001
             visual_error = {"type": type(exc).__name__, "message": str(exc)}
     chart_path = Path(visual_artifact["path"]) if visual_artifact else None
-    outbox_evidence = write_visual_outbox(
-        visual_artifact,
-        caption,
-        report_text,
-        dry_run=args.dry_run,
-        source_payload=visual_source_payload,
+    outbox_evidence = (
+        write_visual_outbox(
+            visual_artifact,
+            caption,
+            report_text,
+            dry_run=args.dry_run,
+        )
+        if visual_artifact
+        else None
     )
     latest_payload["visual"] = {
         "selected_modality": "image" if visual_artifact else "text",
@@ -4121,18 +4609,16 @@ def _run_locked(args: argparse.Namespace) -> int:
                 "status": "dry_run",
                 "candidate_count": collection.raw_candidate_count,
                 "eligible_count": len(signals),
-                "selected_count": len(selected),
                 "pushed_count": len(digest_items),
-                "strong_signal_count": strong_count,
+                "high_score_count": high_count,
                 "display_count": display_count,
                 "display_by_section": {section_key: len(items) for section_key, items in display_sections.items()},
                 "display_recent_suppressed_count": recent_display_suppressed_count,
-                "source_health": collection.source_health,
+                "source_health_status": source_health.get("status"),
                 "digest_items": [
                     digest_item_to_dict(section_key, item)
                     for section_key, item in digest_items
                 ],
-                "selected": [signal_to_dict(signal) for signal in selected],
                 "chart_path": str(chart_path) if chart_path else None,
                 "outbox": outbox_evidence,
                 "visual_error": visual_error,
@@ -4150,12 +4636,17 @@ def _run_locked(args: argparse.Namespace) -> int:
         if visual_error:
             print(f"[VISUAL_FALLBACK] {json.dumps(visual_error, ensure_ascii=False)}")
         if args.explain:
-            print("[EXPLAIN_SELECTED]")
-            for signal in selected:
+            print("[EXPLAIN_SOURCE_HEALTH]")
+            print(json.dumps(source_health, ensure_ascii=False))
+            print("[EXPLAIN_DISPLAYED]")
+            for section_key, item in digest_items:
+                signal = item.representative
                 print(
                     json.dumps(
                         {
+                            "section": section_key,
                             "market_title": signal.market_title,
+                            "market_title_cn": signal.market_title_cn,
                             "story_key": story_key(signal),
                             "score": round(signal.score, 2),
                             "reason": signal.reason,
@@ -4164,6 +4655,7 @@ def _run_locked(args: argparse.Namespace) -> int:
                             "source_status": signal.source_status,
                             "category_reason": signal.category_reason,
                             "translation_status": signal.translation_status,
+                            "translation_engine": signal.translation_engine,
                             "score_breakdown": signal.score_breakdown,
                         },
                         ensure_ascii=False,
@@ -4175,8 +4667,24 @@ def _run_locked(args: argparse.Namespace) -> int:
         return 0
 
     env = load_env()
-    token, chat_id, thread_id = telegram_target(env)
-    delivery_reserved_at = mark_digest_pending(digest_items)
+    try:
+        token, chat_id, thread_id = telegram_target(env)
+    except RuntimeError as exc:
+        # Missing credentials used to die before the send try/except below,
+        # leaving no history record for the freshness sentinel to notice.
+        append_jsonl(
+            HISTORY_PATH,
+            {
+                "timestamp": latest_payload["timestamp"],
+                "status": "config_error",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:400],
+                "candidate_count": collection.raw_candidate_count,
+                "eligible_count": len(signals),
+                "pushed_count": 0,
+            },
+        )
+        raise
     try:
         delivery = deliver_digest(
             token,
@@ -4193,29 +4701,28 @@ def _run_locked(args: argparse.Namespace) -> int:
                 "timestamp": latest_payload["timestamp"],
                 "status": "send_failed",
                 "error_type": type(exc).__name__,
-                "error": str(exc),
+                "error": str(exc)[:400],
                 "candidate_count": collection.raw_candidate_count,
                 "eligible_count": len(signals),
-                "selected_count": len(selected),
-                "selected": [signal_to_dict(signal) for signal in selected],
-                "source_health": collection.source_health,
-                "delivery_reserved_at": delivery_reserved_at,
-                "delivery_state": "pending",
+                "pushed_count": 0,
+                "digest_items": [
+                    digest_item_to_dict(section_key, item)
+                    for section_key, item in digest_items
+                ],
             },
         )
+        notify_send_failure(exc, dry_run=False)
         raise
 
-    pushed_signals = [item.representative for _section_key, item in digest_items]
-    mark_digest_sent(digest_items, sent_at=delivery_reserved_at)
-    mark_sent(pushed_signals)
-    outbox_evidence = write_visual_outbox(
-        visual_artifact,
-        caption,
-        report_text,
-        dry_run=False,
-        delivery=delivery,
-        source_payload=visual_source_payload,
-    )
+    mark_digest_sent(digest_items)
+    if visual_artifact:
+        outbox_evidence = write_visual_outbox(
+            visual_artifact,
+            caption,
+            report_text,
+            dry_run=False,
+            delivery=delivery,
+        )
     latest_payload["delivery"] = delivery
     latest_payload["visual"]["outbox"] = outbox_evidence
     write_json(LATEST_PATH, latest_payload)
@@ -4226,17 +4733,15 @@ def _run_locked(args: argparse.Namespace) -> int:
             "status": "sent",
             "candidate_count": collection.raw_candidate_count,
             "eligible_count": len(signals),
-            "selected_count": len(selected),
             "pushed_count": len(digest_items),
-            "strong_signal_count": strong_count,
+            "high_score_count": high_count,
             "display_count": display_count,
             "display_by_section": {section_key: len(items) for section_key, items in display_sections.items()},
             "display_recent_suppressed_count": recent_display_suppressed_count,
-            "source_health": collection.source_health,
+            "source_health_status": source_health.get("status"),
             "delivery": delivery,
             "chat_id": chat_id,
             "message_thread_id": thread_id,
-            "selected": [signal_to_dict(signal) for signal in selected],
             "digest_items": [
                 digest_item_to_dict(section_key, item)
                 for section_key, item in digest_items
@@ -4256,11 +4761,11 @@ def _run_locked(args: argparse.Namespace) -> int:
                 "status": "sent",
                 "candidate_count": collection.raw_candidate_count,
                 "eligible_count": len(signals),
-                "selected_count": len(selected),
                 "pushed_count": len(digest_items),
-                "strong_signal_count": strong_count,
+                "high_score_count": high_count,
                 "display_count": display_count,
                 "display_recent_suppressed_count": recent_display_suppressed_count,
+                "source_health_status": source_health.get("status"),
                 "delivery": delivery,
                 "chat_id": chat_id,
                 "message_thread_id": thread_id,
@@ -4273,24 +4778,119 @@ def _run_locked(args: argparse.Namespace) -> int:
     return 0
 
 
-def run(args: argparse.Namespace) -> int:
-    with single_instance_lock(RUN_LOCK_PATH):
-        return _run_locked(args)
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read-only Polymarket news radar for NE Telegram.")
+    parser = argparse.ArgumentParser(description="Read-only Polymarket sentiment radar for Telegram.")
     parser.add_argument("--limit", type=int, default=120, help="Per-query Gamma events limit.")
     parser.add_argument("--dry-run", action="store_true", help="Do not send Telegram or mark cooldown.")
-    parser.add_argument("--force", action="store_true", help="Ignore cooldown and score threshold for sendable candidates.")
+    parser.add_argument("--force", action="store_true", help="Ignore the display cooldown for this run.")
     parser.add_argument("--no-image", action="store_true", help="Send text only.")
-    parser.add_argument("--explain", action="store_true", help="Print selected/rejected diagnostics during dry-run.")
+    parser.add_argument("--no-llm", action="store_true", help="Skip the LLM translation pass; rule translation only.")
+    parser.add_argument("--explain", action="store_true", help="Print display/rejected diagnostics during dry-run.")
+    parser.add_argument("--selftest", action="store_true", help="Run offline regression checks (no network, no Telegram) and exit.")
     return parser
+
+
+def selftest() -> int:
+    """Offline regression checks: pure functions only — no Gamma, no Telegram.
+
+    Lets a deploy box prove the translation/scoring core is intact with
+    `--selftest`; the pytest suite in tests/ remains the full authority.
+    """
+    import tempfile
+
+    failures: list[str] = []
+    total = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal total
+        total += 1
+        print(("PASS " if ok else "FAIL ") + name + (f" | {detail}" if detail else ""))
+        if not ok:
+            failures.append(name)
+
+    text = localize_market_text("Will Reform UK win the Clacton by-election?")
+    check("by-election survives", "截至" not in text and "by-election" in text, text)
+    text = localize_market_text("Ninjas in Pyjamas vs Team Spirit (BO3)")
+    check("'in Pyjamas' survives", "在" not in text and "in Pyjamas" in text, text)
+    text = localize_market_text("Dota 2: Team Falcons vs LGD Gaming (BO3) - The International Group Stage")
+    check("esports dash survives", "至" not in text and "-" in text, text)
+    text = localize_market_text("Elon Musk # of tweets July 18 - 25?")
+    check("date range keeps 至", "至25" in text.replace(" ", ""), text)
+    text = localize_market_text("Will the US strike Iran by August 30?")
+    check("uppercase US translated", "美国" in text and "伊朗" in text, text)
+    text = localize_market_text("Will they let us join the group?")
+    check("pronoun 'us' untouched", "美国" not in text, text)
+    text = localize_market_text("F-16 delivery to Ukraine announced?")
+    check("F-16 survives", "F-16" in text, text)
+
+    deadline, _ = infer_question_deadline(
+        "Will X happen by August 20?", reference=datetime(2026, 8, 15, tzinfo=timezone.utc)
+    )
+    check("by-<date> exclusive deadline", deadline == datetime(2026, 8, 21, tzinfo=timezone.utc), str(deadline))
+    deadline, _ = infer_question_deadline(
+        "Will X happen by January 5?", reference=datetime(2026, 12, 20, tzinfo=timezone.utc)
+    )
+    check("deadline year rollover", deadline is not None and deadline.year == 2027, str(deadline))
+    deadline, _ = infer_question_deadline("Will X happen by February 30, 2026?")
+    check("malformed date tolerated", deadline is None, str(deadline))
+    check("month map matches calendar", [MONTH_NUMBER_EN[month] for month in MONTHS_CN] == list(range(1, 13)))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        target = Path(tmp_dir) / "nested" / "atomic.json"
+        write_json(target, {"a": 1})
+        write_json(target, {"a": 2})
+        leftovers = list(target.parent.glob("*.tmp-*"))
+        check("write_json atomic + clean", json.loads(target.read_text()) == {"a": 2} and not leftovers, str(leftovers))
+
+    section_keys = [section_key for section_key, _label, _categories in SECTION_DEFS]
+    check("seven sections defined", len(section_keys) == 7, ",".join(section_keys))
+    for table_name, table in (
+        ("color block", SECTION_COLOR_BLOCKS),
+        ("interest bonus", SECTION_INTEREST_BONUS),
+        ("visual accent", VISUAL_SECTION_ACCENTS),
+        ("discovery queries", DISCOVERY_QUERIES_BY_SECTION),
+    ):
+        check(f"every section has a {table_name}", all(key in table for key in section_keys))
+    check(
+        "society categories mapped",
+        CATEGORY_TO_SECTION.get("society_weather_health_science") == "society_science"
+        and CATEGORY_TO_SECTION.get("other") == "society_science",
+    )
+
+    tail_market = {
+        "volume24hr": 250_000,
+        "liquidityNum": 60_000,
+        "oneDayPriceChange": 0.05,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.97", "0.03"]',
+    }
+    _, _, tail_breakdown = score_signal({}, tail_market, OTHER_CATEGORY, 24.0, "ok", "confirmed")
+    _, _, mid_breakdown = score_signal(
+        {}, dict(tail_market, outcomePrices='["0.50", "0.50"]'), OTHER_CATEGORY, 24.0, "ok", "confirmed"
+    )
+    check(
+        "tail-probability move damped",
+        tail_breakdown.get("move_tail_damped") == 1.0
+        and mid_breakdown.get("move_tail_damped") == 0.0
+        and tail_breakdown["move"] < mid_breakdown["move"],
+        f"tail={tail_breakdown['move']} mid={mid_breakdown['move']}",
+    )
+
+    check(
+        "probe delta math",
+        probability_delta_since_last_run("m1", 0.62, {"m1": {"p": 0.5}}) == 0.12
+        and probability_delta_since_last_run("m2", 0.62, {}) is None,
+    )
+
+    print(f"SELFTEST {'FAIL' if failures else 'OK'} passed={total - len(failures)}/{total}")
+    return 1 if failures else 0
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.selftest:
+        return selftest()
     return run(args)
 
 

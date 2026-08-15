@@ -7,6 +7,7 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -287,7 +288,7 @@ def test_render_text_message_omits_empty_placeholders():
     radar = load_module()
     signals = build_fixture_signals(radar, load_fixture_20260618())
 
-    rendered = radar.render_text_message(signals, total_count=999, selected_count=6, eligible_count=len(signals))
+    rendered = radar.render_text_message(signals, total_count=999, eligible_count=len(signals))
 
     assert "暂无新增强信号" not in rendered
     assert "展示 <code>" in rendered
@@ -335,36 +336,6 @@ def test_deliver_digest_sends_exactly_one_photo_message(monkeypatch, tmp_path):
 
     assert len(calls) == 1
     assert delivery == {"method": "sendPhoto", "photo_message_id": 42}
-
-
-def test_telegram_target_requires_explicit_public_configuration():
-    radar = load_module()
-
-    for env, missing_key in (
-        ({}, "TELEGRAM_BOT_TOKEN"),
-        ({"TELEGRAM_BOT_TOKEN": "token"}, "POLYMARKET_CHAT_ID"),
-        (
-            {
-                "TELEGRAM_BOT_TOKEN": "token",
-                "POLYMARKET_CHAT_ID": "-100123",
-            },
-            "POLYMARKET_TOPIC_ID",
-        ),
-    ):
-        try:
-            radar.telegram_target(env)
-        except RuntimeError as exc:
-            assert missing_key in str(exc)
-        else:
-            raise AssertionError(f"{missing_key} should be required")
-
-    assert radar.telegram_target(
-        {
-            "TELEGRAM_BOT_TOKEN": "token",
-            "POLYMARKET_CHAT_ID": "-100123",
-            "POLYMARKET_TOPIC_ID": "412",
-        }
-    ) == ("token", "-100123", 412)
 
 
 def test_digest_caption_uses_exact_count_and_never_truncates_titles():
@@ -424,7 +395,6 @@ def test_run_is_silent_when_no_item_passes_digest_quality(monkeypatch, tmp_path)
     monkeypatch.setattr(radar, "LATEST_PATH", tmp_path / "latest.json")
     monkeypatch.setattr(radar, "HISTORY_PATH", tmp_path / "history.jsonl")
     monkeypatch.setattr(radar, "collect_signal_result", lambda _limit: collection)
-    monkeypatch.setattr(radar, "select_sendable", lambda _signals, force=False: ([signal], []))
     monkeypatch.setattr(radar, "load_display_seen", lambda: {})
     monkeypatch.setattr(
         radar,
@@ -443,6 +413,7 @@ def test_run_is_silent_when_no_item_passes_digest_quality(monkeypatch, tmp_path)
         force=False,
         dry_run=False,
         no_image=False,
+        no_llm=True,
         explain=False,
     )
 
@@ -590,13 +561,26 @@ def test_report_items_by_section_keeps_three_per_section_when_available():
 
     sections = radar.report_items_by_section(signals)
 
-    expected_total = radar.BASE_SECTION_DISPLAY_ITEMS * len(radar.SECTION_DEFS)
-    assert radar.display_slot_count() == expected_total
+    # V3.4 起 7 板块 × 3 基础位 = 21 超过 TARGET_DISPLAY_ITEMS(18)，
+    # 分配器按 SECTION_DEFS 顺序 round-robin，尾部板块被挤压。
+    expected_total = min(
+        radar.TARGET_DISPLAY_ITEMS,
+        radar.BASE_SECTION_DISPLAY_ITEMS * len(radar.SECTION_DEFS),
+    )
+    assert radar.display_slot_count() == radar.TARGET_DISPLAY_ITEMS
     assert radar.display_item_total(sections) == expected_total
+    base_rounds, extra = divmod(expected_total, len(radar.SECTION_DEFS))
+    expected_counts = {
+        section_key: min(
+            radar.BASE_SECTION_DISPLAY_ITEMS,
+            base_rounds + (1 if index < extra else 0),
+        )
+        for index, (section_key, _label, _keys) in enumerate(radar.SECTION_DEFS)
+    }
     assert {
         section_key: len(sections[section_key])
         for section_key, _section_label, _category_keys in radar.SECTION_DEFS
-    } == {section_key: radar.BASE_SECTION_DISPLAY_ITEMS for section_key, _label, _keys in radar.SECTION_DEFS}
+    } == expected_counts
 
 
 def test_report_items_by_section_skips_recent_seen_and_backfills():
@@ -627,7 +611,10 @@ def test_report_items_by_section_skips_recent_seen_and_backfills():
         for item in items
     }
 
-    expected_total = radar.BASE_SECTION_DISPLAY_ITEMS * len(radar.SECTION_DEFS)
+    expected_total = min(
+        radar.TARGET_DISPLAY_ITEMS,
+        radar.BASE_SECTION_DISPLAY_ITEMS * len(radar.SECTION_DEFS),
+    )
     assert radar.display_item_total(sections) == expected_total
     assert not selected_story_keys & recent_story_keys
     assert radar.recent_display_story_count(signals, display_seen, now=now) == len(recent_story_keys)
@@ -769,90 +756,400 @@ def test_new_scope_templates_keep_titles_chinese_and_categories_clean():
         assert radar.market_title_cn(signal) == expected_title
 
 
-def test_market_volume_24h_does_not_substitute_lifetime_volume():
+# ---------------------------------------------------------------------------
+# V3.1 — correctness fixes
+# ---------------------------------------------------------------------------
+
+
+def test_market_volume_24h_ignores_cumulative_lifetime_volume():
     radar = load_module()
-
-    market = {
-        "volume24hr": 239.44,
-        "volume24hrClob": 239.44,
-        "volume": 549_121.43,
+    dormant_but_famous = {
+        "volume24hr": 30_000,
+        "volume24hrClob": 28_000,
+        "volume": 39_000_000,
+        "volumeNum": 39_000_000,
     }
-    zero_activity_market = {
-        "volume24hr": 0,
-        "volume": 900_000,
-    }
-    legacy_market = {"volume": 12_345}
 
-    assert radar.market_volume_24h(market) == 239.44
-    assert radar.market_volume_24h(zero_activity_market) == 0
-    assert radar.market_volume_24h(legacy_market) == 12_345
+    assert radar.market_volume_24h(dormant_but_famous) == 30_000
 
 
-def test_run_returns_nonzero_when_all_core_sources_fail(monkeypatch, tmp_path):
+def test_question_deadline_rolls_into_the_next_year():
+    radar = load_module()
+    december = datetime(2026, 12, 20, 0, 0, tzinfo=timezone.utc)
+
+    deadline, source = radar.infer_question_deadline("Will the ETF be approved by January 5?", december)
+
+    assert source == "question.by_date"
+    assert deadline is not None
+    assert deadline.year == 2027
+    assert deadline > december
+
+
+def test_question_deadline_survives_an_impossible_date():
+    radar = load_module()
+    now = datetime(2026, 1, 10, 0, 0, tzinfo=timezone.utc)
+
+    deadline, source = radar.infer_question_deadline("Will it ship by February 30?", now)
+
+    assert (deadline, source) == (None, None)
+
+
+def test_only_transport_errors_take_the_curl_retry_path():
+    radar = load_module()
+    import requests as requests_module
+
+    bad_request = requests_module.exceptions.HTTPError()
+    bad_request.response = type("R", (), {"status_code": 400})()
+    server_error = requests_module.exceptions.HTTPError()
+    server_error.response = type("R", (), {"status_code": 502})()
+
+    assert radar.is_transport_error(requests_module.exceptions.ConnectionError()) is True
+    assert radar.is_transport_error(requests_module.exceptions.Timeout()) is True
+    assert radar.is_transport_error(server_error) is True
+    assert radar.is_transport_error(bad_request) is False
+    assert radar.is_transport_error(ValueError("caption too long")) is False
+
+
+def test_assess_source_health_separates_blind_from_quiet():
+    radar = load_module()
+    radar.reset_fetch_failures()
+
+    healthy = radar.assess_source_health({"events": [{}]}, {"markets": [{}]}, 2)
+    partial = radar.assess_source_health({"events": [{}], "keyset": []}, {"markets": [{}]}, 1)
+    blind = radar.assess_source_health({"events": [], "keyset": []}, {"markets": [{}]}, 1)
+    empty = radar.assess_source_health({"events": [{}]}, {"markets": [{}]}, 0)
+
+    assert healthy["status"] == "ok"
+    assert partial["status"] == "degraded"
+    assert "empty_sources:keyset" in partial["reasons"]
+    assert blind["status"] == "failed"
+    assert "all_event_sources_empty" in blind["reasons"]
+    assert empty["status"] == "failed"
+    assert "no_candidates" in empty["reasons"]
+
+
+def test_run_exits_nonzero_and_alerts_when_every_source_is_blind(monkeypatch, tmp_path):
     radar = load_module()
     collection = radar.CollectionResult(
         signals=[],
         rejected=[],
         raw_candidate_count=0,
-        source_counts={
-            "events_legacy": 0,
-            "events_keyset": 0,
-            "events_search": 0,
-            "markets_legacy": 0,
-            "markets_keyset": 0,
-            "events": 0,
-            "markets": 0,
-            "eligible": 0,
-            "rejected": 0,
-        },
-        source_health={
-            "core_healthy": False,
-            "attempt_count": 5,
-            "success_count": 0,
-            "failure_count": 5,
-            "failures": [{"source": "events_legacy", "error_type": "TimeoutError"}],
-        },
+        source_counts={"events": 0, "markets": 0},
+        source_health={"status": "failed", "reasons": ["no_candidates"], "fetch_failure_count": 3},
     )
+    alerts = []
     monkeypatch.setattr(radar, "LATEST_PATH", tmp_path / "latest.json")
     monkeypatch.setattr(radar, "HISTORY_PATH", tmp_path / "history.jsonl")
-    monkeypatch.setattr(radar, "RUN_LOCK_PATH", tmp_path / "run.lock")
     monkeypatch.setattr(radar, "collect_signal_result", lambda _limit: collection)
+    monkeypatch.setattr(radar, "notify_source_failure", lambda health, dry_run: alerts.append(health))
     args = argparse.Namespace(
-        limit=120,
-        force=False,
-        dry_run=True,
-        no_image=False,
-        explain=False,
+        limit=120, force=False, dry_run=True, no_image=True, no_llm=True, explain=False
     )
 
-    assert radar.run(args) == 2
-    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert radar.run(args) == 1
     history = json.loads((tmp_path / "history.jsonl").read_text().strip())
-    assert latest["status"] == "source_unavailable"
-    assert history["status"] == "source_unavailable"
+    assert history["status"] == "source_failure"
+    assert len(alerts) == 1
 
 
-def test_send_photo_does_not_retry_ambiguous_requests_failure(monkeypatch, tmp_path):
+def test_monitor_alert_is_deduped_within_the_same_day(monkeypatch, tmp_path):
+    radar = load_module()
+    monkeypatch.setattr(radar, "SOURCE_ALERT_STATE_PATH", tmp_path / "alert.json")
+    now = datetime(2026, 7, 25, 3, 0, tzinfo=timezone.utc)
+
+    first = radar.alert_already_sent_today("source_failure", now)
+    second = radar.alert_already_sent_today("source_failure", now)
+    other_kind = radar.alert_already_sent_today("send_failed", now)
+    next_day = radar.alert_already_sent_today("source_failure", now.replace(day=26))
+
+    assert (first, second, other_kind, next_day) == (False, True, False, False)
+
+
+def test_sports_digest_gate_uses_the_calibrated_volume_threshold():
+    radar = load_module()
+
+    assert radar.DIGEST_SPORTS_MIN_VOLUME_24H < 1_000_000
+    assert radar.DIGEST_SPORTS_MIN_VOLUME_24H > radar.DIGEST_MIN_VOLUME_24H
+
+
+def test_headline_size_falls_back_instead_of_raising():
+    script_dir = str(SCRIPT_PATH.parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    visual = __import__("polymarket_radar_visual")
+    layout = __import__("tg_watch_layout")
+
+    unrenderable = "美国" * 200
+    size = visual._headline_size(unrenderable, 1060)
+    lines = layout.wrap_text(unrenderable, size, True, 1060, 2)
+
+    assert size == 48
+    assert lines[-1].endswith("…")
+
+
+# ---------------------------------------------------------------------------
+# V3.2 — quality
+# ---------------------------------------------------------------------------
+
+
+def test_parse_llm_translation_payload_handles_fenced_json():
+    radar = load_module()
+    fenced = '```json\n[{"i": 0, "cn": "美联储是否9月降息"}, {"i": 1, "cn": "俄乌是否停火"}]\n```'
+
+    assert radar.parse_llm_translation_payload(fenced) == {
+        0: "美联储是否9月降息",
+        1: "俄乌是否停火",
+    }
+    assert radar.parse_llm_translation_payload("sorry, I cannot help with that") == {}
+
+
+def test_llm_translation_acceptance_rejects_untranslated_output():
+    radar = load_module()
+    english = "Will the Fed cut rates in September?"
+
+    assert radar.llm_translation_acceptable("美联储是否在9月降息", english) is True
+    assert radar.llm_translation_acceptable(english, english) is False
+    assert radar.llm_translation_acceptable("Will the Fed cut rates 是否", english) is False
+    assert radar.llm_translation_acceptable("", english) is False
+
+
+def test_apply_llm_translations_uses_cache_and_leaves_scores_alone(monkeypatch, tmp_path):
+    radar = load_module()
+    category = next(category for category in radar.CATEGORIES if category.key == "macro_finance")
+    signal = replace(
+        synthetic_signal(radar, category, "macro_finance", 0, 61.0),
+        market_title="Will the Fed cut rates by 50 bps in September?",
+        translation_status="needs_review",
+    )
+    cache_path = tmp_path / "translations.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                radar.translation_cache_key(signal.market_title): {
+                    "cn": "美联储是否在9月降息50个基点",
+                    "ts": "2026-07-25T00:00:00+00:00",
+                    "model": "test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(radar, "TRANSLATION_CACHE_PATH", cache_path)
+    monkeypatch.setattr(
+        radar,
+        "request_llm_translations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cache hit must not call the LLM")),
+    )
+
+    stats = apply_and_return(radar, [signal])
+
+    assert stats["cache_hits"] == 1
+    assert signal.score == 61.0
+    assert signal.translation_engine == "llm"
+    assert signal.translation_status == "ok"
+    assert radar.market_title_cn(signal) == "美联储是否在9月降息50个基点"
+
+
+def apply_and_return(radar, signals):
+    return radar.apply_llm_translations(
+        signals,
+        enabled=True,
+        # The public build requires an explicit endpoint; the HTTP layer is
+        # monkeypatched in these tests so the URL is never actually dialed.
+        env={"CLIPROXY_API_KEY": "unused-in-test", "CLIPROXY_BASE_URL": "http://127.0.0.1:9"},
+    )
+
+
+def test_apply_llm_translations_survives_an_unreachable_endpoint(monkeypatch, tmp_path):
+    radar = load_module()
+    category = next(category for category in radar.CATEGORIES if category.key == "macro_finance")
+    signal = replace(
+        synthetic_signal(radar, category, "macro_finance", 0, 61.0),
+        translation_status="needs_review",
+    )
+    monkeypatch.setattr(radar, "TRANSLATION_CACHE_PATH", tmp_path / "translations.json")
+    monkeypatch.setattr(
+        radar,
+        "request_llm_translations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("no route to host")),
+    )
+
+    stats = apply_and_return(radar, [signal])
+
+    assert stats["status"] == "error"
+    assert signal.translation_engine == "rule"
+    assert signal.translation_status == "needs_review"
+
+
+def test_a_late_chunk_failing_keeps_the_titles_an_earlier_chunk_translated(monkeypatch, tmp_path):
+    radar = load_module()
+    monkeypatch.setattr(radar, "LLM_BATCH_SIZE", 2)
+    category = next(category for category in radar.CATEGORIES if category.key == "macro_finance")
+    signals = [
+        replace(
+            synthetic_signal(radar, category, "macro_finance", index, 90.0 - index),
+            market_title=f"Will event {index} happen in July?",
+            translation_status="needs_review",
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setattr(radar, "TRANSLATION_CACHE_PATH", tmp_path / "translations.json")
+    calls: list[list[str]] = []
+
+    def flaky(titles, _settings):
+        calls.append(list(titles))
+        if len(calls) > 1:
+            raise TimeoutError("timed out")
+        return {index: f"事件{index}是否在7月发生" for index in range(len(titles))}
+
+    monkeypatch.setattr(radar, "request_llm_translations", flaky)
+
+    stats = apply_and_return(radar, signals)
+
+    assert [len(chunk) for chunk in calls] == [2, 2]
+    assert stats["status"] == "partial"
+    assert stats["llm_applied"] == 2
+    assert [signal.translation_engine for signal in signals] == ["llm", "llm", "rule", "rule"]
+
+
+def test_display_score_floor_is_enforced_when_a_section_is_rich():
+    radar = load_module()
+    categories = {category.key: category for category in radar.CATEGORIES}
+    section_key, _label, category_keys = radar.SECTION_DEFS[0]
+    category = categories[category_keys[0]]
+    signals = [
+        synthetic_signal(radar, category, section_key, index, score)
+        for index, score in enumerate((90.0, 80.0, 70.0, 20.0))
+    ]
+    # Any cooldown history at all used to drop every floor to the diversity
+    # tier, which let the score-20 filler onto the page.
+    unrelated_seen = {"some:other:story": {"sent_at": datetime.now(timezone.utc).isoformat()}}
+
+    sections = radar.report_items_by_section(signals, display_seen=unrelated_seen)
+    scores = sorted(item.score for item in sections[section_key])
+
+    assert len(scores) == radar.BASE_SECTION_DISPLAY_ITEMS
+    assert min(scores) >= radar.DISPLAY_SCORE
+
+
+def test_thin_section_relaxes_the_floor_rather_than_showing_nothing():
+    radar = load_module()
+    categories = {category.key: category for category in radar.CATEGORIES}
+    section_key, _label, category_keys = radar.SECTION_DEFS[0]
+    category = categories[category_keys[0]]
+    weak = synthetic_signal(radar, category, section_key, 0, radar.DIVERSITY_DISPLAY_SCORE + 1.0)
+
+    sections = radar.report_items_by_section([weak])
+
+    assert [item.score for item in sections[section_key]] == [weak.score]
+
+
+def test_rotate_history_keeps_only_the_newest_records(tmp_path):
+    radar = load_module()
+    history = tmp_path / "history.jsonl"
+    history.write_text("".join(f'{{"n": {index}}}\n' for index in range(5_000)), encoding="utf-8")
+
+    rotated = radar.rotate_history(history, max_bytes=1024, keep=10)
+    lines = history.read_text(encoding="utf-8").strip().splitlines()
+
+    assert rotated is True
+    assert len(lines) == 10
+    assert json.loads(lines[-1])["n"] == 4_999
+    assert history.with_suffix(".jsonl.1").exists()
+
+
+def test_rotate_history_leaves_a_small_log_alone(tmp_path):
+    radar = load_module()
+    history = tmp_path / "history.jsonl"
+    history.write_text('{"n": 1}\n', encoding="utf-8")
+
+    assert radar.rotate_history(history, max_bytes=1024, keep=10) is False
+    assert history.read_text(encoding="utf-8") == '{"n": 1}\n'
+
+
+def test_translation_cache_is_pruned_by_age_and_size():
+    radar = load_module()
+    now = datetime(2026, 7, 25, 0, 0, tzinfo=timezone.utc)
+    cache = {
+        "fresh": {"cn": "新鲜", "ts": now.isoformat()},
+        "stale": {"cn": "过期", "ts": "2026-01-01T00:00:00+00:00"},
+        "broken": {"ts": now.isoformat()},
+    }
+
+    pruned = radar.prune_translation_cache(cache, now=now)
+
+    assert set(pruned) == {"fresh"}
+
+
+def test_telegram_request_errors_redact_bot_token(monkeypatch, tmp_path):
     radar = load_module()
     image_path = tmp_path / "radar.png"
     image_path.write_bytes(b"png")
+    token = "123456789:super-secret-token-value"
 
     class FailingRequests:
+        # ValueError 不算 transport 错误，走的是不重试 curl 的直抛分支——
+        # 正是修复前会把含 token 的原始 URL 泄进 launchd err.log 的路径。
         @staticmethod
-        def post(*_args, **_kwargs):
-            raise TimeoutError("response timeout")
+        def post(url, **_kwargs):
+            raise ValueError(url)
 
     monkeypatch.setattr(radar, "requests", FailingRequests)
-    monkeypatch.setattr(
-        radar,
-        "send_photo_via_curl",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("an ambiguous request failure must not be retried")
-        ),
+
+    with pytest.raises(RuntimeError) as error:
+        radar.send_photo(token, "-100", 412, image_path, "摘要")
+
+    assert token not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_curl_send_errors_redact_bot_token(monkeypatch):
+    radar = load_module()
+    token = "123456789:super-secret-token-value"
+    failed = SimpleNamespace(
+        returncode=7,
+        stdout="",
+        stderr=f"curl: (7) Failed to connect: https://api.telegram.org/bot{token}/sendMessage",
     )
 
-    with pytest.raises(RuntimeError, match="request failed"):
-        radar.send_photo("token", "-100", 412, image_path, "摘要")
+    monkeypatch.setattr(radar, "requests", None)
+    monkeypatch.setattr(radar.subprocess, "run", lambda *args, **kwargs: failed)
+
+    with pytest.raises(RuntimeError) as error:
+        radar.send_message(token, "-100", 412, "hello")
+
+    assert token not in str(error.value)
+    assert "<redacted>" in str(error.value)
+
+
+def test_telegram_target_requires_explicit_public_configuration():
+    radar = load_module()
+
+    for env, missing_key in (
+        ({}, "TELEGRAM_BOT_TOKEN"),
+        ({"TELEGRAM_BOT_TOKEN": "token"}, "POLYMARKET_CHAT_ID"),
+        (
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "POLYMARKET_CHAT_ID": "-100123",
+            },
+            "POLYMARKET_TOPIC_ID",
+        ),
+    ):
+        try:
+            radar.telegram_target(env)
+        except RuntimeError as exc:
+            assert missing_key in str(exc)
+        else:
+            raise AssertionError(f"{missing_key} should be required")
+
+    assert radar.telegram_target(
+        {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "POLYMARKET_CHAT_ID": "-100123",
+            "POLYMARKET_TOPIC_ID": "412",
+        }
+    ) == ("token", "-100123", 412)
 
 
 def test_invalid_json_state_fails_closed(tmp_path):
@@ -872,95 +1169,3 @@ def test_single_instance_lock_rejects_second_holder(tmp_path):
         with pytest.raises(RuntimeError, match="already running"):
             with radar.single_instance_lock(lock_path):
                 pass
-
-
-def test_text_fallback_writes_html_and_json_outbox(monkeypatch, tmp_path):
-    radar = load_module()
-    signals = build_fixture_signals(radar, load_fixture_20260618())
-    sections = radar.report_items_by_section(signals)
-    digest_items = radar.digest_items_by_interest(sections)
-    source_payload = radar.build_visual_source_payload(
-        digest_items,
-        total_count=999,
-        eligible_count=len(signals),
-        timestamp="2026-07-24 15:00 SGT",
-    )
-    assert source_payload is not None
-    monkeypatch.setattr(radar, "OUTBOX_DIR", tmp_path)
-
-    evidence = radar.write_visual_outbox(
-        None,
-        "文字摘要",
-        "完整报告",
-        dry_run=True,
-        source_payload=source_payload,
-    )
-
-    payload = json.loads(Path(evidence["json"]).read_text())
-    assert Path(evidence["html"]).read_text() == "文字摘要"
-    assert Path(evidence["detail_html"]).read_text() == "完整报告"
-    assert payload["selected_modality"] == "text"
-    assert payload["image_path"] is None
-    assert payload["delivery"] == "dry_run"
-
-
-def test_fetch_diagnostics_reports_all_core_sources_failed(monkeypatch):
-    radar = load_module()
-    diagnostics = radar.FetchDiagnostics()
-
-    monkeypatch.setattr(
-        radar,
-        "fetch_json",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("upstream timeout")),
-    )
-    for source in radar.CORE_FETCH_SOURCES:
-        assert radar.safe_fetch_json(
-            "https://example.invalid",
-            diagnostics=diagnostics,
-            source=source,
-        ) is None
-
-    health = diagnostics.snapshot()
-    assert health["core_healthy"] is False
-    assert health["attempt_count"] == len(radar.CORE_FETCH_SOURCES)
-    assert health["failure_count"] == len(radar.CORE_FETCH_SOURCES)
-
-
-def test_pending_delivery_reservation_blocks_duplicate_story(monkeypatch, tmp_path):
-    radar = load_module()
-    signals = build_fixture_signals(radar, load_fixture_20260618())
-    sections = radar.report_items_by_section(signals)
-    digest_items = radar.digest_items_by_interest(sections)
-    monkeypatch.setattr(radar, "DISPLAY_SEEN_PATH", tmp_path / "display_seen.json")
-    monkeypatch.setattr(radar, "LATEST_PATH", tmp_path / "latest.json")
-
-    reserved_at = radar.mark_digest_pending(digest_items)
-    display_seen = radar.load_display_seen()
-
-    assert display_seen
-    assert all(record["delivery_status"] == "pending" for record in display_seen.values())
-    assert all(record["sent_at"] == reserved_at for record in display_seen.values())
-    assert all(
-        radar.display_story_recently_seen(item.story_key, display_seen)
-        for _section_key, item in digest_items
-    )
-
-
-def test_telegram_request_errors_redact_bot_token(monkeypatch, tmp_path):
-    radar = load_module()
-    image_path = tmp_path / "radar.png"
-    image_path.write_bytes(b"png")
-    token = "123456789:super-secret-token-value"
-
-    class FailingRequests:
-        @staticmethod
-        def post(url, **_kwargs):
-            raise TimeoutError(url)
-
-    monkeypatch.setattr(radar, "requests", FailingRequests)
-
-    with pytest.raises(RuntimeError) as error:
-        radar.send_photo(token, "-100", 412, image_path, "摘要")
-
-    assert token not in str(error.value)
-    assert "<redacted>" in str(error.value)

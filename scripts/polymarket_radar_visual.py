@@ -141,11 +141,18 @@ def _hex_color(value: str) -> tuple[int, int, int]:
 
 
 def _headline_size(text: str, max_width: int) -> int:
-    for size in (58, 54, 50, 48):
+    """Pick the largest size that fits two lines, else fall back to the floor.
+
+    An over-long headline used to abort the whole render, which cost the push
+    its card and dropped it to plain text. Returning the floor lets the layout
+    ellipsize the tail instead; the full title still ships in the caption.
+    """
+    sizes = (58, 54, 50, 48)
+    for size in sizes:
         lines = L.wrap_text(text, size, True, max_width, 2)
         if lines and not lines[-1].endswith("…"):
             return size
-    raise VisualBundleError("headline cannot fit in two lines at the mobile-safe font floor")
+    return sizes[-1]
 
 
 def _cjk_sample(value: Any, limit: int = 16) -> str:
@@ -166,6 +173,7 @@ def _annotate_png(
     bundle: Mapping[str, Any],
     validation: Mapping[str, Any],
     title_font: int,
+    text_truncated: bool = False,
 ) -> dict[str, str]:
     visual = bundle["visual_spec"]
     render = bundle["render_spec"]
@@ -199,7 +207,7 @@ def _annotate_png(
         "min_title_font_px": str(title_font),
         "min_body_font_px": str(MIN_BODY_FONT),
         "min_metadata_font_px": str(MIN_METADATA_FONT),
-        "text_truncated": "false",
+        "text_truncated": "true" if text_truncated else "false",
         "render_engine": "tg-watch-layout+pillow",
     }
     pnginfo = PngImagePlugin.PngInfo()
@@ -218,6 +226,8 @@ def render_front_page(bundle: Mapping[str, Any], output_path: Path) -> dict[str,
     palette = L.light_palette(accent=accent)
     headline = str(data["headline"])
     title_font = _headline_size(headline, 1060)
+    headline_lines = L.wrap_text(headline, title_font, True, 1060, 2)
+    headline_truncated = bool(headline_lines) and headline_lines[-1].endswith("…")
     probability = float(data["probability"])
     if not 0.0 <= probability <= 1.0:
         raise VisualBundleError("probability must be between 0 and 1")
@@ -335,11 +345,12 @@ def render_front_page(bundle: Mapping[str, Any], output_path: Path) -> dict[str,
         rail_color=accent,
         min_height=1040,
     )
-    metadata = _annotate_png(output_path, bundle, validation, title_font)
+    metadata = _annotate_png(output_path, bundle, validation, title_font, headline_truncated)
     return {
         "image_path": str(output_path),
         "render_engine": metadata["render_engine"],
         "font_warning": not bool(metadata["font_path"]),
+        "headline_truncated": headline_truncated,
         "validation": dict(validation),
         "metadata": metadata,
     }

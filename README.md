@@ -12,7 +12,7 @@
 
 在我看来，Polymarket 更接近一个带有赌博性质的预测市场。我不建议大家为了追逐短期结果去下注，也不把它的价格当成事实、建议或确定答案。
 
-但它有一个非常有价值的侧面：每个概率背后都是真实参与者用资金表达的判断。把这些市场隐含概率放在一起观察，可以快速了解人们此刻对地缘政治、宏观经济、加密资产、科技商业、政治政策和体育文化事件的情绪与分歧。
+但它有一个非常有价值的侧面：每个概率背后都是真实参与者用资金表达的判断。把这些市场隐含概率放在一起观察，可以快速了解人们此刻对地缘政治、宏观经济、加密资产、科技商业、政治政策、体育文化与社会科学事件的情绪与分歧。
 
 对于投资者，这种情绪面可以作为研究流程中的一个参考维度。它不能替代基本面、数据核验或独立判断，但可以帮助我们更早发现市场正在关注什么、哪些预期正在快速变化，以及风险偏好正在往哪个方向移动。
 
@@ -24,15 +24,17 @@
 
 - 从公开的 Polymarket Gamma API 读取活跃市场，不需要钱包或私钥
 - 过滤已经过期、即将失效、流动性不足或语义不清楚的事件
-- 将事件整理为六大板块，并优先选择三个不同板块的头版内容
-- 将英文市场问题转换为更容易理解的中文事件描述
+- 将事件整理为七大板块，并优先选择三个不同板块的头版内容
+- 将英文市场问题转换为更容易理解的中文事件描述（可选接入 OpenAI 兼容端点做 LLM 翻译，缺省走规则翻译）
 - 同时显示事件、主要选项概率、24 小时变化和真实的 24 小时成交量
+- 记录每次运行的概率快照，下一次运行时给出跨运行概率变化（Δ）
 - 发送前预留、成功后确认，七天内不重复推送同一故事
 - 过滤低成交赛事、精确比分和发帖数量等低价值噪音
 - 每天只发送一张主视觉卡片和三条摘要，避免长篇信息轰炸
-- 图片模式生成 PNG、HTML 和 JSON outbox；文字 fallback 仍生成 HTML 和 JSON
+- 图片模式生成 PNG、HTML 和 JSON outbox，供本地审计
 - 所有核心数据源失败时非零退出，让 Supervisor、cron 或 systemd 能识别故障
 - 使用单实例锁、原子状态写入和发送前预留，降低并发、崩溃和超时造成的重复推送
+- Telegram 发送错误在抛出前抹去 bot token，凭证不落日志
 
 ## 它不会做什么
 
@@ -54,7 +56,7 @@
 4. 这件事为什么值得关注
 5. 数据来源、时间和版本
 
-Telegram caption 再补充另外两个不同板块的事件。完整六板块报告仍写入本地 outbox，供审计使用，但不会作为第二条长消息主动推送。
+Telegram caption 再补充另外两个不同板块的事件。完整七板块报告仍写入本地 outbox，供审计使用，但不会作为第二条长消息主动推送。
 
 视觉层基于 [TG Watch Skill](https://github.com/EricEEEEEEE/TG-watch-skill) 的 source-bound `VisualSpec → RenderSpec → Pillow` 工作流。每个可见字段都能追溯到源数据，并经过移动端字号、边界、CJK 字体和无截断检查。
 
@@ -103,6 +105,8 @@ POLYMARKET_CHAT_ID=your_chat_or_channel_id
 POLYMARKET_TOPIC_ID=your_topic_id
 ```
 
+可选项：`POLYMARKET_ALERT_TOPIC_ID` 把数据源故障告警路由到单独的 topic（缺省与主 topic 相同）；`CLIPROXY_BASE_URL` + `CLIPROXY_API_KEY`（以及可选的 `CLIPROXY_TRANSLATE_MODEL`）接入任意 OpenAI 兼容端点做标题翻译，不配置则完全离线、走内置规则翻译。
+
 然后运行：
 
 ```bash
@@ -119,29 +123,31 @@ python scripts/polymarket_news_radar.py
 --dry-run   不发送 Telegram，不消耗去重状态
 --force     忽略展示冷却，仅用于人工验收
 --no-image  使用纯文字 fallback
+--no-llm    跳过 LLM 翻译，仅用规则翻译
 --explain   输出入选与淘汰原因
+--selftest  离线回归自检（无网络、无 Telegram），退出码即结果
 --limit N   设置每次 API 查询的事件数量
 ```
 
 ## 数据流程
 
 ```text
-Polymarket Gamma API
+Polymarket Gamma API（legacy + keyset 分页 + 公共搜索多路抓取）
         ↓
 有效性 / 截止时间 / 成交量过滤
         ↓
-中文语义模板与六大板块归类
+中文语义模板与七大板块归类
         ↓
 故事聚类 + 7 天展示去重
         ↓
-跨板块兴趣排序
+跨板块兴趣排序 + 跨运行概率 Δ
         ↓
 一张主卡 + 三条摘要
         ↓
 Telegram + PNG/HTML/JSON outbox
 ```
 
-文字 fallback 不生成 PNG，但始终保留 HTML、详细 HTML 和 JSON 审计记录。
+图片渲染失败时退回纯文字消息；outbox 预览只在图片模式生成。
 
 ## 项目结构
 
@@ -164,7 +170,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-测试覆盖过期事件、截止时间、中文标题、六板块归类、故事聚类、跨板块多样性、七天去重、真实 24 小时成交量、全源故障退出、单实例锁、损坏状态保护、Telegram 模糊超时、文字 fallback outbox、单消息发送、长标题、缺失变化值、极端概率和 source binding。
+测试覆盖过期事件、截止时间、中文标题、七板块归类、故事聚类、跨板块多样性、七天去重、真实 24 小时成交量、跨运行概率 Δ、翻译缓存清理、历史轮转、单实例锁、损坏状态保护、Telegram token 脱敏、单消息发送、长标题、缺失变化值、极端概率和 source binding。另有 `--selftest` 提供部署机上的离线自检。
 
 ## 重要说明
 
@@ -178,6 +184,6 @@ python -m pytest tests -q
 
 ## English summary
 
-Polymarket Sentiment Radar turns public prediction-market data into a concise Chinese daily briefing. It does not place bets or connect to a wallet. Instead, it treats market-implied probabilities as a sentiment signal: useful for seeing what people currently believe, fear, or debate across macro, geopolitics, crypto, technology, politics, and culture.
+Polymarket Sentiment Radar turns public prediction-market data into a concise Chinese daily briefing. It does not place bets or connect to a wallet. Instead, it treats market-implied probabilities as a sentiment signal: useful for seeing what people currently believe, fear, or debate across macro, geopolitics, crypto, technology, politics, culture, and social science.
 
-The system filters stale and low-quality markets, localizes event questions into Chinese, avoids repeating pushed stories for seven days, selects three different topics, and renders one mobile-first Telegram card plus a short caption. Probabilities are market prices, not facts or advice.
+The system filters stale and low-quality markets, localizes event questions into Chinese (optionally via any OpenAI-compatible LLM endpoint), tracks probability deltas across runs, avoids repeating pushed stories for seven days, selects three different topics across seven sections, and renders one mobile-first Telegram card plus a short caption. Probabilities are market prices, not facts or advice.
