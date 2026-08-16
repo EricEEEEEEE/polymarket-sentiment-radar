@@ -19,13 +19,50 @@ FIXTURE_PATH = ROOT / "tests" / "fixtures" / "polymarket_news_radar_fixture_2026
 FIXTURE_20260618_PATH = ROOT / "tests" / "fixtures" / "polymarket_news_radar_fixture_20260618.json"
 
 
+_STATE_REDIRECT: Path | None = None
+
+
+@pytest.fixture(autouse=True)
+def _keep_production_state_untouched(tmp_path):
+    """Send every module-level state path into the test's own tmp dir.
+
+    The radar resolves its state paths once at import time, so a test that
+    drives run() writes the real state/ directory unless each constant is
+    rebound. Rebinding them by scanning — instead of listing them one by one —
+    also covers state files added by later versions: PROBE_SNAPSHOT_PATH
+    arrived in V3.4, nobody rebound it, and a plain `pytest` run overwrote the
+    probability baseline of a live deployment.
+    """
+    global _STATE_REDIRECT
+    _STATE_REDIRECT = tmp_path / "radar-state"
+    try:
+        yield
+    finally:
+        _STATE_REDIRECT = None
+
+
 def load_module():
     spec = importlib.util.spec_from_file_location("polymarket_news_radar", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules["polymarket_news_radar"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    _redirect_writable_paths(module)
     return module
+
+
+def _redirect_writable_paths(module) -> None:
+    if _STATE_REDIRECT is None:  # module loaded outside a test
+        return
+    sandbox = _STATE_REDIRECT
+    sandbox.mkdir(parents=True, exist_ok=True)
+    for name, value in list(vars(module).items()):
+        if isinstance(value, Path) and value.parent in (module.STATE_DIR, module.OUTBOX_DIR):
+            setattr(module, name, sandbox / value.name)
+    module.STATE_DIR = sandbox
+    module.OUTBOX_DIR = sandbox / "outbox"
+    # Tests must never reach a deployment's real credentials, not even to read.
+    module.ENV_PATH = sandbox / ".env"
 
 
 def load_fixture():
